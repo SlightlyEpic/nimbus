@@ -1,3 +1,5 @@
+mod storage;
+
 fn main() {
-    println!("Hello, world!");
+    let dm = storage::disk::DiskManager::new("/var/lib/nimbus".into());
 }
