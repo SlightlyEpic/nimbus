@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub struct FileManager {
     file_path: String,
-    file: File,
+    pub file: File,
 }
 
 impl FileManager {
