@@ -1,5 +1,6 @@
 use crate::constants;
-use crate::storage::page::page;
+use crate::storage::page::{DiskPage, page};
+use crate::storage::util;
 use std::num::NonZeroU64;
 
 // Stores the mapping from page_id -> file_offset
@@ -16,10 +17,12 @@ pub struct DirectoryEntry {
     free_space: usize,
 }
 
-impl page::DiskPage for DirectoryPage {
+impl DiskPage for DirectoryPage {
     const PAGE_KIND: u8 = page::PageKind::Directory as u8;
+}
 
-    fn serialize_for_disk(self: &Self) -> [u8; constants::storage::DISK_PAGE_SIZE] {
+impl util::SerdeFixed<{ constants::storage::DISK_PAGE_SIZE }> for DirectoryPage {
+    fn serialize(self: &Self) -> [u8; constants::storage::DISK_PAGE_SIZE] {
         // Layout format:
         // <header>: Containes page kind, so from_disk_page can verify whether it is reading a directory page or not. Also contains a page_id
         // <next offset>: offset of the next directory page
@@ -62,36 +65,35 @@ impl page::DiskPage for DirectoryPage {
         buf
     }
 
-    fn deserialize_from_disk(raw_page_data: &[u8; constants::storage::DISK_PAGE_SIZE]) -> Self {
+    fn deserialize(raw: &[u8; constants::storage::DISK_PAGE_SIZE]) -> Self {
         // Reconstruct from the data array using the layout specified above
 
         // Page kind check
-        let kind = raw_page_data[0];
+        let kind = raw[0];
         assert_eq!(kind, Self::PAGE_KIND, "Wrong page kind");
 
         // page_id
-        let page_id_val = u64::from_le_bytes(raw_page_data[1..9].try_into().unwrap());
+        let page_id_val = u64::from_le_bytes(raw[1..9].try_into().unwrap());
         let page_id = page::PageId::new(page_id_val);
 
         // next_offset
-        let next_raw = u64::from_le_bytes(raw_page_data[9..17].try_into().unwrap());
+        let next_raw = u64::from_le_bytes(raw[9..17].try_into().unwrap());
         let next_offset = NonZeroU64::new(next_raw);
 
         // entries length
-        let entries_len = u32::from_le_bytes(raw_page_data[17..21].try_into().unwrap()) as usize;
+        let entries_len = u32::from_le_bytes(raw[17..21].try_into().unwrap()) as usize;
 
         // Deserialize entries
         let mut entries = Vec::with_capacity(entries_len);
         let mut pos = 21;
         for _ in 0..entries_len {
-            let pid_val = u64::from_le_bytes(raw_page_data[pos..pos + 8].try_into().unwrap());
+            let pid_val = u64::from_le_bytes(raw[pos..pos + 8].try_into().unwrap());
             pos += 8;
 
-            let offset_val = u64::from_le_bytes(raw_page_data[pos..pos + 8].try_into().unwrap());
+            let offset_val = u64::from_le_bytes(raw[pos..pos + 8].try_into().unwrap());
             pos += 8;
 
-            let free_val =
-                u32::from_le_bytes(raw_page_data[pos..pos + 4].try_into().unwrap()) as usize;
+            let free_val = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
             entries.push(DirectoryEntry {
@@ -101,7 +103,7 @@ impl page::DiskPage for DirectoryPage {
             });
         }
 
-        DirectoryPage {
+        Self {
             page_id,
             next_offset,
             entries,

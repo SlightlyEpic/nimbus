@@ -1,14 +1,15 @@
-use crate::{constants, storage::page::directory_page::DirectoryPage};
+use crate::storage::{
+    page::{data_page::DataPage, directory_page::DirectoryPage},
+    util::SerdeDyn,
+};
 
 pub enum PageKind {
     Directory = 1,
+    Data = 2,
 }
 
 pub trait DiskPage {
     const PAGE_KIND: u8;
-
-    fn serialize_for_disk(self: &Self) -> [u8; constants::storage::DISK_PAGE_SIZE];
-    fn deserialize_from_disk(raw_page_data: &[u8; constants::storage::DISK_PAGE_SIZE]) -> Self;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,4 +27,5 @@ impl PageId {
 
 pub enum Page {
     Directory(DirectoryPage),
+    Data(DataPage),
 }
