@@ -2,12 +2,12 @@ use crate::constants;
 use crate::storage::page::page;
 
 // Slotted page implementation
-pub struct DataPage {
+pub struct SlottedDataPage {
     raw: [u8; constants::storage::DISK_PAGE_SIZE],
 }
 
-impl page::DiskPage for DataPage {
-    const PAGE_KIND: u8 = page::PageKind::Data as u8;
+impl page::DiskPage for SlottedDataPage {
+    const PAGE_KIND: u8 = page::PageKind::SlottedData as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
         return &self.raw;
@@ -18,7 +18,7 @@ impl page::DiskPage for DataPage {
     }
 }
 
-impl DataPage {
+impl SlottedDataPage {
     // === Memory layout ===
     //   0..  1 -> Page Kind  (u8)         -|
     //   4..  8 -> Free space (u32)         | Header (64 bytes)
@@ -34,7 +34,7 @@ impl DataPage {
         let mut page = Self {
             raw: [0u8; constants::storage::DISK_PAGE_SIZE],
         };
-        page.set_page_kind(page::PageKind::Data);
+        page.set_page_kind(page::PageKind::SlottedData);
         page.set_free_space(constants::storage::DISK_PAGE_SIZE as u32 - 64 - 2);
 
         page

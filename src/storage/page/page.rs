@@ -2,12 +2,12 @@ use std::num::NonZeroU64;
 
 use crate::{
     constants,
-    storage::page::{data_page::DataPage, directory_page::DirectoryPage},
+    storage::page::{directory_page::DirectoryPage, slotted_data_page::SlottedDataPage},
 };
 
 pub enum PageKind {
     Directory = 1,
-    Data = 2,
+    SlottedData = 2,
 }
 
 pub trait DiskPage {
@@ -21,5 +21,5 @@ pub type PageId = NonZeroU64;
 
 pub enum Page {
     Directory(DirectoryPage),
-    Data(DataPage),
+    SlottedData(SlottedDataPage),
 }
