@@ -28,7 +28,6 @@ impl DiskPage for DirectoryPage {
 }
 
 impl DirectoryPage {
-    // Assumes 4K alignment for self.raw, might cause unexpected behaviour otherwise
     // === Memory layout ===
     //   0..  1 -> Page Kind  (u8)         -|
     //   4..  8 -> Free space (u32)         | Header (64 bytes)
@@ -46,10 +45,11 @@ impl DirectoryPage {
     const ENTRY_SIZE: usize = 32;
 
     // Notes:
+    // - Assumes 4K alignment for self.raw, might cause unexpected behaviour otherwise
     // - If a directory page has a next page, it's entries are guaranteed to contain the offset for that page
     // - Could add [#inline] to getters and setters. Look into it later.
 
-    fn new() -> Self {
+    const fn new() -> Self {
         let mut page = Self {
             raw: [0u8; constants::storage::DISK_PAGE_SIZE],
         };
@@ -65,18 +65,18 @@ impl DirectoryPage {
 
     // === Direct Getters ===
 
-    pub fn page_kind(&self) -> u8 {
+    pub const fn page_kind(&self) -> u8 {
         self.raw[0]
     }
 
-    fn free_space(&self) -> u32 {
+    pub const fn free_space(&self) -> u32 {
         unsafe {
             let ptr = self.raw.as_ptr().add(4) as *const u32;
             u32::from_le(*ptr)
         }
     }
 
-    pub fn page_id(&self) -> page::PageId {
+    pub const fn page_id(&self) -> page::PageId {
         unsafe {
             let ptr = self.raw.as_ptr().add(8) as *const u64;
             let val = u64::from_le(*ptr);
@@ -84,7 +84,7 @@ impl DirectoryPage {
         }
     }
 
-    pub fn next_directory_page_id(&self) -> Option<page::PageId> {
+    pub const fn next_directory_page_id(&self) -> Option<page::PageId> {
         unsafe {
             let ptr = self.raw.as_ptr().add(64) as *const u64;
             let val = u64::from_le(*ptr);
@@ -92,14 +92,14 @@ impl DirectoryPage {
         }
     }
 
-    pub fn num_entries(&self) -> u16 {
+    pub const fn num_entries(&self) -> u16 {
         unsafe {
             let ptr = self.raw.as_ptr().add(72) as *const u16;
             u16::from_le(*ptr)
         }
     }
 
-    pub fn entry_page_id(&self, idx: usize) -> Option<page::PageId> {
+    pub const fn entry_page_id(&self, idx: usize) -> Option<page::PageId> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -111,7 +111,7 @@ impl DirectoryPage {
         }
     }
 
-    pub fn entry_file_offset(&self, idx: usize) -> Option<NonZeroU64> {
+    pub const fn entry_file_offset(&self, idx: usize) -> Option<NonZeroU64> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -123,7 +123,7 @@ impl DirectoryPage {
         }
     }
 
-    pub fn entry_free_space(&self, idx: usize) -> Option<u32> {
+    pub const fn entry_free_space(&self, idx: usize) -> Option<u32> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -136,7 +136,7 @@ impl DirectoryPage {
 
     // === Indirect Getters ===
 
-    pub fn entry_at(&self, idx: usize) -> Option<DirectoryPageEntry> {
+    pub const fn entry_at(&self, idx: usize) -> Option<DirectoryPageEntry> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -149,55 +149,61 @@ impl DirectoryPage {
 
     // === Direct Setters ===
 
-    fn set_page_kind(&mut self, kind: page::PageKind) {
+    const fn set_page_kind(&mut self, kind: page::PageKind) {
         self.raw[0] = kind as u8;
     }
 
-    fn set_free_space(&mut self, free: u32) {
+    const fn set_free_space(&mut self, free: u32) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(4) as *mut u32;
             *ptr = free.to_le();
         }
     }
 
-    pub fn set_page_id(&mut self, id: page::PageId) {
+    pub const fn set_page_id(&mut self, id: page::PageId) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
             *ptr = id.get().to_le();
         }
     }
 
-    pub fn set_next_directory_page_id(&mut self, id: NonZeroU64) {
+    pub const fn set_next_directory_page_id(&mut self, id: NonZeroU64) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(64) as *mut u64;
             *ptr = id.get().to_le();
         }
     }
 
-    fn set_num_entries(&mut self, n: u16) {
+    const fn set_num_entries(&mut self, n: u16) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(72) as *mut u16;
             *ptr = n.to_le();
         }
     }
 
-    fn set_entry_page_id(&mut self, idx: usize, id: Option<page::PageId>) {
+    const fn set_entry_page_id(&mut self, idx: usize, id: Option<page::PageId>) {
         let base = 80 + idx * Self::ENTRY_SIZE;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
-            *ptr = id.map_or(0, |nz| nz.get()).to_le();
+            *ptr = match id {
+                Some(nz_value) => nz_value.get().to_le(),
+                None => 0u64.to_le(),
+            }
         }
     }
 
-    fn set_entry_file_offset(&mut self, idx: usize, offset: Option<NonZeroU64>) {
+    const fn set_entry_file_offset(&mut self, idx: usize, offset: Option<NonZeroU64>) {
         let base = 80 + idx * Self::ENTRY_SIZE + 8;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
-            *ptr = offset.map_or(0, |nz| nz.get()).to_le();
+            *ptr = match offset {
+                Some(nz_value) => nz_value.get().to_le(),
+                None => 0u64.to_le(),
+            }
         }
     }
 
-    fn set_entry_free_space(&mut self, idx: usize, free: u32) {
+    const fn set_entry_free_space(&mut self, idx: usize, free: u32) {
         let base = 80 + idx * Self::ENTRY_SIZE + 16;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u32;
@@ -207,7 +213,10 @@ impl DirectoryPage {
 
     // === Indirect setters ===
 
-    pub fn add_entry(&mut self, entry: DirectoryPageEntry) -> Result<(), errors::AddEntryError> {
+    pub const fn add_entry(
+        &mut self,
+        entry: DirectoryPageEntry,
+    ) -> Result<(), errors::AddEntryError> {
         let free_space = self.free_space();
         if free_space < 32 {
             return Err(errors::AddEntryError::InsufficientSpace);
@@ -225,7 +234,7 @@ impl DirectoryPage {
     }
 
     // Just zeroes out the memory region of an entry
-    fn erase_entry(&mut self, idx: usize) {
+    const fn erase_entry(&mut self, idx: usize) {
         let base = 80 + idx * Self::ENTRY_SIZE + 8;
         assert!(
             base + Self::ENTRY_SIZE <= self.raw.len(),
@@ -237,7 +246,7 @@ impl DirectoryPage {
         }
     }
 
-    fn swap_entries(&mut self, idx_a: usize, idx_b: usize) {
+    const fn swap_entries(&mut self, idx_a: usize, idx_b: usize) {
         if idx_a == idx_b {
             return;
         }
@@ -265,7 +274,7 @@ impl DirectoryPage {
         }
     }
 
-    pub fn remove_entry_at(&mut self, idx: usize) -> Result<(), errors::RemoveEntryError> {
+    pub const fn remove_entry_at(&mut self, idx: usize) -> Result<(), errors::RemoveEntryError> {
         let num_entries = self.num_entries() as usize;
         if idx >= num_entries {
             return Err(errors::RemoveEntryError::IndexOutOfBounds);
