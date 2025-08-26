@@ -6,33 +6,6 @@ pub struct TableTypeBuilder {
 }
 
 impl primitives::AttributeKind {
-    fn alignment(self) -> usize {
-        match self {
-            primitives::AttributeKind::U8 => 1,
-            primitives::AttributeKind::U16 => 2,
-            primitives::AttributeKind::U32 => 4,
-            primitives::AttributeKind::U64 => 8,
-            primitives::AttributeKind::U128 => 16,
-            primitives::AttributeKind::I8 => 1,
-            primitives::AttributeKind::I16 => 2,
-            primitives::AttributeKind::I32 => 4,
-            primitives::AttributeKind::I64 => 8,
-            primitives::AttributeKind::I128 => 16,
-            primitives::AttributeKind::F32 => 4,
-            primitives::AttributeKind::F64 => 8,
-            primitives::AttributeKind::Bool => 1,
-            primitives::AttributeKind::Char(size) => {
-                const SIZES: [usize; 5] = [1, 2, 4, 8, 16];
-                for s in SIZES {
-                    if size <= s {
-                        return s;
-                    }
-                }
-                16
-            }
-        }
-    }
-
     fn size(self) -> usize {
         match self {
             primitives::AttributeKind::U8 => 1,
@@ -48,7 +21,7 @@ impl primitives::AttributeKind {
             primitives::AttributeKind::F32 => 4,
             primitives::AttributeKind::F64 => 8,
             primitives::AttributeKind::Bool => 1,
-            primitives::AttributeKind::Char(size) => size,
+            primitives::AttributeKind::Char(max_size) => max_size,
         }
     }
 }
@@ -64,7 +37,7 @@ impl TableTypeBuilder {
         // Figure out the layout
         let mut curr_offset = 0;
         let mut last_size = 0;
-        for attr in self.table_type.attributes.iter() {
+        for attr in &self.table_type.attributes {
             let attr_align = attr.kind.alignment();
             if curr_offset % attr_align != 0 {
                 curr_offset += attr_align - (curr_offset % attr_align);
