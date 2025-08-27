@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::storage::page::page::{Page, PageId};
+use crate::storage::page::page_base::{Page, PageId};
 
 pub struct BufferPoolFrame {
     pinned: bool,

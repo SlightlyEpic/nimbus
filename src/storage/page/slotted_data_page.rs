@@ -1,13 +1,13 @@
 use crate::constants;
-use crate::storage::page::page;
+use crate::storage::page::page_base;
 
 // Slotted page implementation
 pub struct SlottedDataPage {
     raw: [u8; constants::storage::DISK_PAGE_SIZE],
 }
 
-impl page::DiskPage for SlottedDataPage {
-    const PAGE_KIND: u8 = page::PageKind::SlottedData as u8;
+impl page_base::DiskPage for SlottedDataPage {
+    const PAGE_KIND: u8 = page_base::PageKind::SlottedData as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
         return &self.raw;
@@ -34,7 +34,7 @@ impl SlottedDataPage {
         let mut page = Self {
             raw: [0u8; constants::storage::DISK_PAGE_SIZE],
         };
-        page.set_page_kind(page::PageKind::SlottedData);
+        page.set_page_kind(page_base::PageKind::SlottedData);
         page.set_free_space(constants::storage::DISK_PAGE_SIZE as u32 - 64 - 2);
 
         page
@@ -53,11 +53,11 @@ impl SlottedDataPage {
         }
     }
 
-    pub const fn page_id(&self) -> page::PageId {
+    pub const fn page_id(&self) -> page_base::PageId {
         unsafe {
             let ptr = self.raw.as_ptr().add(8) as *const u64;
             let val = u64::from_le(*ptr);
-            page::PageId::new(val).unwrap()
+            page_base::PageId::new(val).unwrap()
         }
     }
 
@@ -116,7 +116,7 @@ impl SlottedDataPage {
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: page::PageKind) {
+    const fn set_page_kind(&mut self, kind: page_base::PageKind) {
         self.raw[0] = kind as u8;
     }
 
@@ -127,7 +127,7 @@ impl SlottedDataPage {
         }
     }
 
-    pub const fn set_page_id(&mut self, id: page::PageId) {
+    pub const fn set_page_id(&mut self, id: page_base::PageId) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
             *ptr = id.get().to_le();

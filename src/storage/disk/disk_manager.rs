@@ -1,4 +1,4 @@
-use crate::storage::disk::FileManager;
+use crate::storage::disk::file_manager::FileManager;
 use std::path::PathBuf;
 
 pub struct DiskManager {
