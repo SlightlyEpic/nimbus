@@ -1,5 +1,5 @@
 use crate::constants;
-use crate::storage::page::{DiskPage, page};
+use crate::storage::page::page_base::{self, DiskPage};
 use std::num::NonZeroU64;
 
 // Stores the mapping from page_id -> file_offset
@@ -10,13 +10,13 @@ pub struct DirectoryPage {
 
 #[derive(Clone, Copy)]
 pub struct DirectoryPageEntry {
-    pub page_id: page::PageId,
+    pub page_id: page_base::PageId,
     pub file_offset: NonZeroU64,
     pub free_space: u32,
 }
 
 impl DiskPage for DirectoryPage {
-    const PAGE_KIND: u8 = page::PageKind::Directory as u8;
+    const PAGE_KIND: u8 = page_base::PageKind::Directory as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
         return &self.raw;
@@ -53,7 +53,7 @@ impl DirectoryPage {
         let mut page = Self {
             raw: [0u8; constants::storage::DISK_PAGE_SIZE],
         };
-        page.set_page_kind(page::PageKind::Directory);
+        page.set_page_kind(page_base::PageKind::Directory);
         page.set_free_space(
             constants::storage::DISK_PAGE_SIZE as u32
             - 64 // header
@@ -76,19 +76,19 @@ impl DirectoryPage {
         }
     }
 
-    pub const fn page_id(&self) -> page::PageId {
+    pub const fn page_id(&self) -> page_base::PageId {
         unsafe {
             let ptr = self.raw.as_ptr().add(8) as *const u64;
             let val = u64::from_le(*ptr);
-            page::PageId::new(val).unwrap()
+            page_base::PageId::new(val).unwrap()
         }
     }
 
-    pub const fn next_directory_page_id(&self) -> Option<page::PageId> {
+    pub const fn next_directory_page_id(&self) -> Option<page_base::PageId> {
         unsafe {
             let ptr = self.raw.as_ptr().add(64) as *const u64;
             let val = u64::from_le(*ptr);
-            page::PageId::new(val)
+            page_base::PageId::new(val)
         }
     }
 
@@ -99,7 +99,7 @@ impl DirectoryPage {
         }
     }
 
-    pub const fn entry_page_id(&self, idx: usize) -> Option<page::PageId> {
+    pub const fn entry_page_id(&self, idx: usize) -> Option<page_base::PageId> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -107,7 +107,7 @@ impl DirectoryPage {
         unsafe {
             let ptr = self.raw.as_ptr().add(base) as *const u64;
             let val = u64::from_le(*ptr);
-            page::PageId::new(val)
+            page_base::PageId::new(val)
         }
     }
 
@@ -149,7 +149,7 @@ impl DirectoryPage {
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: page::PageKind) {
+    const fn set_page_kind(&mut self, kind: page_base::PageKind) {
         self.raw[0] = kind as u8;
     }
 
@@ -160,7 +160,7 @@ impl DirectoryPage {
         }
     }
 
-    pub const fn set_page_id(&mut self, id: page::PageId) {
+    pub const fn set_page_id(&mut self, id: page_base::PageId) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
             *ptr = id.get().to_le();
@@ -181,7 +181,7 @@ impl DirectoryPage {
         }
     }
 
-    const fn set_entry_page_id(&mut self, idx: usize, id: Option<page::PageId>) {
+    const fn set_entry_page_id(&mut self, idx: usize, id: Option<page_base::PageId>) {
         let base = 80 + idx * Self::ENTRY_SIZE;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
