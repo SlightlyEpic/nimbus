@@ -6,7 +6,9 @@ use std::num::NonZeroU64;
 
 pub type PageBuf = [u8; constants::storage::DISK_PAGE_SIZE];
 
+// #anchor-pagekind-values
 pub enum PageKind {
+    Invalid = 0,
     Directory = 1,
     SlottedData = 2,
 }
@@ -21,6 +23,16 @@ pub trait DiskPage {
 pub type PageId = NonZeroU64;
 
 pub enum Page<'a> {
+    Invalid(),
     Directory(DirectoryPage<'a>),
     SlottedData(SlottedDataPage<'a>),
+}
+
+pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
+    // MAGIC: ensure that these values match the assigned PageKind values (#anchor-pagekind-values)
+    match buf[0] {
+        1 => PageKind::Directory,
+        2 => PageKind::SlottedData,
+        _ => PageKind::Invalid,
+    }
 }

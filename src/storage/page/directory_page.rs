@@ -49,7 +49,7 @@ impl<'a> DirectoryPage<'a> {
     // - If a directory page has a next page, it's entries are guaranteed to contain the offset for that page
     // - Could add [#inline] to getters and setters. Look into it later.
 
-    const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
+    pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
         let mut page = Self { raw };
         page.set_page_kind(page_base::PageKind::Directory);
         page.set_free_space(

@@ -1,5 +1,6 @@
 use crate::constants;
 use crate::storage::page::page_base;
+use std::marker::PhantomPinned;
 
 // Slotted page implementation
 pub struct SlottedDataPage<'a> {
@@ -30,7 +31,7 @@ impl<'a> SlottedDataPage<'a> {
     //  ...(slot offsets, slot lengths)
     //  ...data (from the end)
 
-    const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
+    pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
         let mut page = Self { raw };
         page.set_page_kind(page_base::PageKind::SlottedData);
         page.set_free_space(constants::storage::DISK_PAGE_SIZE as u32 - 64 - 2);
