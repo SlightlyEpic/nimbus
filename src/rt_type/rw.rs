@@ -24,7 +24,7 @@ impl<'a> LayoutReadWriter<'a> {
     pub fn read_attr(
         &self,
         attr: &TableAttribute,
-        page: &[u8; constants::storage::DISK_PAGE_SIZE],
+        page: &[u8; constants::storage::PAGE_SIZE],
         base_offset: u16,
     ) -> Result<AttributeValue, errors::ReadAttrError> {
         let offset = base_offset
@@ -127,7 +127,7 @@ impl<'a> LayoutReadWriter<'a> {
         &self,
         attr: &TableAttribute,
         value: AttributeValue,
-        page: &mut [u8; constants::storage::DISK_PAGE_SIZE],
+        page: &mut [u8; constants::storage::PAGE_SIZE],
         base_offset: u16,
     ) -> Result<(), errors::WriteAttrError> {
         let offset = base_offset

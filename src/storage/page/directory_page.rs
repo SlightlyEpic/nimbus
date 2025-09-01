@@ -4,8 +4,8 @@ use std::num::NonZeroU64;
 
 // Stores the mapping from page_id -> file_offset
 // Directory pages form a linked list
-pub struct DirectoryPage {
-    raw: [u8; constants::storage::DISK_PAGE_SIZE],
+pub struct DirectoryPage<'a> {
+    raw: &'a mut page_base::PageBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -15,19 +15,19 @@ pub struct DirectoryPageEntry {
     pub free_space: u32,
 }
 
-impl DiskPage for DirectoryPage {
+impl<'a> DiskPage for DirectoryPage<'a> {
     const PAGE_KIND: u8 = page_base::PageKind::Directory as u8;
 
-    fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
     }
 
-    fn raw_mut(&mut self) -> &mut [u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw_mut(&mut self) -> &mut [u8; constants::storage::PAGE_SIZE] {
         return &mut self.raw;
     }
 }
 
-impl DirectoryPage {
+impl<'a> DirectoryPage<'a> {
     // === Memory layout ===
     //   0..  1 -> Page Kind  (u8)         -|
     //   4..  8 -> Free space (u32)         | Header (64 bytes)
@@ -49,13 +49,11 @@ impl DirectoryPage {
     // - If a directory page has a next page, it's entries are guaranteed to contain the offset for that page
     // - Could add [#inline] to getters and setters. Look into it later.
 
-    const fn new() -> Self {
-        let mut page = Self {
-            raw: [0u8; constants::storage::DISK_PAGE_SIZE],
-        };
+    pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
+        let mut page = Self { raw };
         page.set_page_kind(page_base::PageKind::Directory);
         page.set_free_space(
-            constants::storage::DISK_PAGE_SIZE as u32
+            constants::storage::PAGE_SIZE as u32
             - 64 // header
             - 16, // other fields
         );

@@ -1,4 +1,4 @@
+pub mod buffer;
 pub mod disk;
-pub mod memory;
 pub mod page;
 pub mod util;
