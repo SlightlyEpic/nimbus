@@ -10,11 +10,11 @@ pub struct SlottedDataPage<'a> {
 impl<'a> page_base::DiskPage for SlottedDataPage<'a> {
     const PAGE_KIND: u8 = page_base::PageKind::SlottedData as u8;
 
-    fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
     }
 
-    fn raw_mut(&mut self) -> &mut [u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw_mut(&mut self) -> &mut [u8; constants::storage::PAGE_SIZE] {
         return &mut self.raw;
     }
 }
@@ -34,7 +34,7 @@ impl<'a> SlottedDataPage<'a> {
     pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
         let mut page = Self { raw };
         page.set_page_kind(page_base::PageKind::SlottedData);
-        page.set_free_space(constants::storage::DISK_PAGE_SIZE as u32 - 64 - 2);
+        page.set_free_space(constants::storage::PAGE_SIZE as u32 - 64 - 2);
 
         page
     }
@@ -168,7 +168,7 @@ impl<'a> SlottedDataPage<'a> {
 
         let num_slots = self.num_slots() as usize;
         let last_offset = match num_slots {
-            0 => constants::storage::DISK_PAGE_SIZE,
+            0 => constants::storage::PAGE_SIZE,
             _ => unsafe { self.slot_offset(num_slots - 1).unwrap_unchecked() as usize },
         };
         let slot_offset = last_offset - data_len;

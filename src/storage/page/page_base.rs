@@ -4,7 +4,7 @@ use crate::{
 };
 use std::num::NonZeroU64;
 
-pub type PageBuf = [u8; constants::storage::DISK_PAGE_SIZE];
+pub type PageBuf = [u8; constants::storage::PAGE_SIZE];
 
 // #anchor-pagekind-values
 pub enum PageKind {

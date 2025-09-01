@@ -18,11 +18,11 @@ pub struct DirectoryPageEntry {
 impl<'a> DiskPage for DirectoryPage<'a> {
     const PAGE_KIND: u8 = page_base::PageKind::Directory as u8;
 
-    fn raw(self: &Self) -> &[u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
     }
 
-    fn raw_mut(&mut self) -> &mut [u8; constants::storage::DISK_PAGE_SIZE] {
+    fn raw_mut(&mut self) -> &mut [u8; constants::storage::PAGE_SIZE] {
         return &mut self.raw;
     }
 }
@@ -53,7 +53,7 @@ impl<'a> DirectoryPage<'a> {
         let mut page = Self { raw };
         page.set_page_kind(page_base::PageKind::Directory);
         page.set_free_space(
-            constants::storage::DISK_PAGE_SIZE as u32
+            constants::storage::PAGE_SIZE as u32
             - 64 // header
             - 16, // other fields
         );

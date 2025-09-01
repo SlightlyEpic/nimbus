@@ -33,12 +33,9 @@ impl FileManager {
         Ok(Self { file_path, file })
     }
 
-    pub fn read_block_into(
-        &mut self,
-        offset: usize,
-        buf: &mut page_base::PageBuf,
-    ) -> io::Result<()> {
-        let byte_offset = (offset * constants::storage::DISK_PAGE_SIZE) as u64;
+    /// buf: Should be a PageBuf slice
+    pub fn read_block_into(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let byte_offset = offset * constants::storage::PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(byte_offset))?;
         // SAFETY: buf must be 4K aligned and length multiple of 512 (kernel requirement).
         self.file.read_exact(buf)?;
@@ -46,8 +43,9 @@ impl FileManager {
         Ok(())
     }
 
-    pub fn write_block_from(&mut self, offset: usize, buf: &page_base::PageBuf) -> io::Result<()> {
-        let byte_offset = (offset * constants::storage::DISK_PAGE_SIZE) as u64;
+    /// buf: Should be a PageBuf slice
+    pub fn write_block_from(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        let byte_offset = offset * constants::storage::PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(byte_offset))?;
 
         self.file.write_all(buf)?;
