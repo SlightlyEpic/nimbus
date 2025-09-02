@@ -13,6 +13,7 @@ pub struct Frame {
     ready: bool,
     pinned: bool,
     dirty: bool,
+    file_offset: u64,                 // can be garbage as long as is_ready is false
     page_id: page_base::PageId, // redundant field for faster reads, can be garbage as long as is_ready is false
     buf_ptr: *mut page_base::PageBuf, // raw pointer into frames_backing_buf
 }
@@ -56,31 +57,39 @@ impl Frame {
     }
 }
 
+#[derive(Copy, Clone)]
 struct FrameMeta {
     file_offset: u64,
+    page_id: page_base::PageId,
+    frame_id: u32,
 }
 
-pub struct BufferPool<E: Evictor> {
+pub struct BufferPool {
     frames_backing_buf: Box<[u8; FRAME_COUNT * constants::storage::PAGE_SIZE]>,
     frames: [Option<Frame>; FRAME_COUNT],
-    frames_meta: HashMap<page_base::PageId, FrameMeta>, // because each frame is uniquely identified by its page_id
     free_frames: u32,
 
+    // need to keep metadata indexed by both page id and file offset because
+    // those are the two ways a BufferPool user can access a page
+    frames_meta_pid: HashMap<page_base::PageId, FrameMeta>, // because each frame is uniquely identified by its page_id
+    frames_meta_offset: HashMap<u64, FrameMeta>,
+
     file_manager: disk::FileManager,
-    evictor: E,
+    evictor: Box<dyn Evictor>,
 
     _pin: std::marker::PhantomPinned,
 }
 
-impl<E: Evictor> BufferPool<E> {
-    pub fn new(file_manager: disk::FileManager, evictor: E) -> Self {
+impl BufferPool {
+    pub fn new(file_manager: disk::FileManager, evictor: Box<dyn Evictor>) -> Self {
         Self {
             frames_backing_buf: Box::new([0u8; FRAME_COUNT * constants::storage::PAGE_SIZE]),
             frames: std::array::from_fn(|_| None),
-            file_manager,
             free_frames: FRAME_COUNT as u32,
+            frames_meta_pid: HashMap::new(),
+            frames_meta_offset: HashMap::new(),
+            file_manager,
             evictor,
-            frames_meta: HashMap::default(),
             _pin: std::marker::PhantomPinned::default(),
         }
     }
@@ -104,6 +113,18 @@ impl<E: Evictor> BufferPool<E> {
     ) -> Result<&mut Frame, errors::FetchPageError> {
         let self_mut_ref = unsafe { self.get_unchecked_mut() };
 
+        // is page is this offset already loaded?
+        let is_loaded = self_mut_ref.frames_meta_offset.contains_key(&offset);
+
+        // if yes then no need to load, return that frame
+        if is_loaded {
+            let meta = self_mut_ref.frames_meta_offset.get(&offset).unwrap();
+            return Ok(self_mut_ref.frames[meta.frame_id as usize]
+                .as_mut()
+                .unwrap());
+        }
+
+        // if not then create a frame and load it
         let frame_idx = self_mut_ref
             .find_free_frame_with_evict()
             .ok_or(errors::FetchPageError::BufferFull)?;
@@ -123,7 +144,29 @@ impl<E: Evictor> BufferPool<E> {
 
         let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
 
+        // fill in page specific details
         frame.ready = true;
+        frame.file_offset = offset;
+        frame.page_id = match frame.page_view() {
+            page_base::Page::Directory(page) => page.page_id(),
+            page_base::Page::SlottedData(page) => page.page_id(),
+            page_base::Page::Invalid() => panic!("attempt to load invalid page"),
+        };
+
+        // bookkeeping
+        let frame_meta = FrameMeta {
+            frame_id: frame_idx as u32,
+            file_offset: frame.file_offset,
+            page_id: frame.page_id,
+        };
+        self_mut_ref
+            .frames_meta_pid
+            .insert(frame_meta.page_id, frame_meta);
+        self_mut_ref
+            .frames_meta_offset
+            .insert(frame_meta.file_offset, frame_meta);
+
+        // evictor bookkeeping
         self_mut_ref.evictor.notify_frame_alloc(frame);
         self_mut_ref.evictor.set_frame_evictable(frame, true);
 
@@ -147,6 +190,7 @@ impl<E: Evictor> BufferPool<E> {
                 ready: false,
                 dirty: false,
                 pinned: false,
+                file_offset: 0,
                 page_id: page_base::PageId::new(1).unwrap(),
                 buf_ptr: buf_ptr,
             };
@@ -157,9 +201,17 @@ impl<E: Evictor> BufferPool<E> {
 
     /// SAFETY: must following pinning rules
     fn dealloc_frame_at(self: &mut Self, frame_idx: usize) {
+        let frame = self.frames[frame_idx].unwrap();
+
         self.frames[frame_idx] = None;
-        self.evictor.notify_frame_destroy(frame_idx as u32);
+
+        // bookkeeping
+        self.frames_meta_pid.remove(&frame.page_id);
+        self.frames_meta_offset.remove(&frame.file_offset);
         self.free_frames += 1;
+
+        // evictor bookkeeping
+        self.evictor.notify_frame_destroy(frame_idx as u32);
     }
 
     /// SAFETY: must following pinning rules
@@ -206,8 +258,3 @@ pub mod errors {
         IOError,
     }
 }
-
-// TODO:
-// Need to make something external to the buffer pool
-// which knows how to traverse the page directory (currently)
-// So that there can be other page lookup implementation later
