@@ -1,3 +1,3 @@
-mod locator;
+pub mod locator;
 
 pub use locator::PageLocator;
