@@ -1,6 +1,6 @@
 use crate::{
     constants,
-    storage::page::{directory_page::DirectoryPage, slotted_data_page::SlottedDataPage},
+    storage::page::{directory::Directory, slotted_data::SlottedData},
 };
 use std::num::NonZeroU64;
 
@@ -24,8 +24,8 @@ pub type PageId = NonZeroU64;
 
 pub enum Page<'a> {
     Invalid(),
-    Directory(DirectoryPage<'a>),
-    SlottedData(SlottedDataPage<'a>),
+    Directory(Directory<'a>),
+    SlottedData(SlottedData<'a>),
 }
 
 pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {

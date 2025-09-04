@@ -1,6 +1,6 @@
-pub mod directory_page;
-pub mod page_base;
-pub mod slotted_data_page;
+pub mod base;
+pub mod directory;
+pub mod slotted_data;
 
-pub use directory_page::DirectoryPage;
-pub use slotted_data_page::SlottedDataPage;
+pub use directory::Directory;
+pub use slotted_data::SlottedData;

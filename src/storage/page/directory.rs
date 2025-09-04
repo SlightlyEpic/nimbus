@@ -1,22 +1,22 @@
 use crate::constants;
-use crate::storage::page::page_base::{self, DiskPage};
+use crate::storage::page::base::{self, DiskPage};
 use std::num::NonZeroU64;
 
 // Stores the mapping from page_id -> file_offset
 // Directory pages form a linked list
-pub struct DirectoryPage<'a> {
-    raw: &'a mut page_base::PageBuf,
+pub struct Directory<'a> {
+    raw: &'a mut base::PageBuf,
 }
 
 #[derive(Clone, Copy)]
-pub struct DirectoryPageEntry {
-    pub page_id: page_base::PageId,
+pub struct DirectoryEntry {
+    pub page_id: base::PageId,
     pub file_offset: NonZeroU64,
     pub free_space: u32,
 }
 
-impl<'a> DiskPage for DirectoryPage<'a> {
-    const PAGE_KIND: u8 = page_base::PageKind::Directory as u8;
+impl<'a> DiskPage for Directory<'a> {
+    const PAGE_KIND: u8 = base::PageKind::Directory as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
@@ -27,7 +27,7 @@ impl<'a> DiskPage for DirectoryPage<'a> {
     }
 }
 
-impl<'a> DirectoryPage<'a> {
+impl<'a> Directory<'a> {
     // === Memory layout ===
     //   0..  1 -> Page Kind  (u8)         -|
     //   4..  8 -> Free space (u32)         | Header (64 bytes)
@@ -49,9 +49,9 @@ impl<'a> DirectoryPage<'a> {
     // - If a directory page has a next page, it's entries are guaranteed to contain the offset for that page
     // - Could add [#inline] to getters and setters. Look into it later.
 
-    pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
+    pub const fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
         let mut page = Self { raw };
-        page.set_page_kind(page_base::PageKind::Directory);
+        page.set_page_kind(base::PageKind::Directory);
         page.set_free_space(
             constants::storage::PAGE_SIZE as u32
             - 64 // header
@@ -74,19 +74,19 @@ impl<'a> DirectoryPage<'a> {
         }
     }
 
-    pub const fn page_id(&self) -> page_base::PageId {
+    pub const fn page_id(&self) -> base::PageId {
         unsafe {
             let ptr = self.raw.as_ptr().add(8) as *const u64;
             let val = u64::from_le(*ptr);
-            page_base::PageId::new(val).unwrap()
+            base::PageId::new(val).unwrap()
         }
     }
 
-    pub const fn next_directory_page_id(&self) -> Option<page_base::PageId> {
+    pub const fn next_directory_page_id(&self) -> Option<base::PageId> {
         unsafe {
             let ptr = self.raw.as_ptr().add(64) as *const u64;
             let val = u64::from_le(*ptr);
-            page_base::PageId::new(val)
+            base::PageId::new(val)
         }
     }
 
@@ -97,7 +97,7 @@ impl<'a> DirectoryPage<'a> {
         }
     }
 
-    pub const fn entry_page_id(&self, idx: usize) -> Option<page_base::PageId> {
+    pub const fn entry_page_id(&self, idx: usize) -> Option<base::PageId> {
         if idx >= self.num_entries() as usize {
             return None;
         }
@@ -105,7 +105,7 @@ impl<'a> DirectoryPage<'a> {
         unsafe {
             let ptr = self.raw.as_ptr().add(base) as *const u64;
             let val = u64::from_le(*ptr);
-            page_base::PageId::new(val)
+            base::PageId::new(val)
         }
     }
 
@@ -134,11 +134,11 @@ impl<'a> DirectoryPage<'a> {
 
     // === Indirect Getters ===
 
-    pub const fn entry_at(&self, idx: usize) -> Option<DirectoryPageEntry> {
+    pub const fn entry_at(&self, idx: usize) -> Option<DirectoryEntry> {
         if idx >= self.num_entries() as usize {
             return None;
         }
-        Some(DirectoryPageEntry {
+        Some(DirectoryEntry {
             page_id: self.entry_page_id(idx).unwrap(),
             file_offset: self.entry_file_offset(idx).unwrap(),
             free_space: self.entry_free_space(idx).unwrap(),
@@ -147,7 +147,7 @@ impl<'a> DirectoryPage<'a> {
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: page_base::PageKind) {
+    const fn set_page_kind(&mut self, kind: base::PageKind) {
         self.raw[0] = kind as u8;
     }
 
@@ -158,7 +158,7 @@ impl<'a> DirectoryPage<'a> {
         }
     }
 
-    pub const fn set_page_id(&mut self, id: page_base::PageId) {
+    pub const fn set_page_id(&mut self, id: base::PageId) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
             *ptr = id.get().to_le();
@@ -179,7 +179,7 @@ impl<'a> DirectoryPage<'a> {
         }
     }
 
-    const fn set_entry_page_id(&mut self, idx: usize, id: Option<page_base::PageId>) {
+    const fn set_entry_page_id(&mut self, idx: usize, id: Option<base::PageId>) {
         let base = 80 + idx * Self::ENTRY_SIZE;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
@@ -211,10 +211,7 @@ impl<'a> DirectoryPage<'a> {
 
     // === Indirect setters ===
 
-    pub const fn add_entry(
-        &mut self,
-        entry: DirectoryPageEntry,
-    ) -> Result<(), errors::AddEntryError> {
+    pub const fn add_entry(&mut self, entry: DirectoryEntry) -> Result<(), errors::AddEntryError> {
         let free_space = self.free_space();
         if free_space < 32 {
             return Err(errors::AddEntryError::InsufficientSpace);

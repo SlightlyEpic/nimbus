@@ -1,5 +1,5 @@
 use crate::storage::buffer::{Evictor, Frame};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 struct EvictorFrameMeta {
     pub fid: u32,

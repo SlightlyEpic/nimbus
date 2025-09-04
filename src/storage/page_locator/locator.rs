@@ -1,16 +1,13 @@
 use crate::storage::{
     buffer::buffer_pool::BufferPoolCore,
-    page::{
-        DirectoryPage,
-        page_base::{self, Page},
-    },
+    page::{self, Directory, base::Page},
 };
 use std::{num::NonZeroU64, pin::Pin};
 
 pub trait PageLocator {
     fn find_file_offset(
         &mut self,
-        page_id: page_base::PageId,
+        page_id: page::base::PageId,
         bp: Pin<&mut BufferPoolCore>,
     ) -> Result<u64, errors::FindOffsetError>;
 }
@@ -20,7 +17,7 @@ pub struct LLDirPageLocator {}
 impl PageLocator for LLDirPageLocator {
     fn find_file_offset(
         &mut self,
-        page_id: page_base::PageId,
+        page_id: page::base::PageId,
         mut bp: Pin<&mut BufferPoolCore>,
     ) -> Result<u64, errors::FindOffsetError> {
         let mut curr_dir_page = bp
@@ -60,7 +57,7 @@ impl PageLocator for LLDirPageLocator {
 }
 
 impl LLDirPageLocator {
-    fn next_page_offset(&self, page: &DirectoryPage) -> u64 {
+    fn next_page_offset(&self, page: &Directory) -> u64 {
         let next_page_id = page
             .next_directory_page_id()
             .expect("next_page_id to be present");

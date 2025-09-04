@@ -1,14 +1,14 @@
 use crate::constants;
-use crate::storage::page::page_base;
+use crate::storage::page::base;
 use std::marker::PhantomPinned;
 
 // Slotted page implementation
-pub struct SlottedDataPage<'a> {
-    raw: &'a mut page_base::PageBuf,
+pub struct SlottedData<'a> {
+    raw: &'a mut base::PageBuf,
 }
 
-impl<'a> page_base::DiskPage for SlottedDataPage<'a> {
-    const PAGE_KIND: u8 = page_base::PageKind::SlottedData as u8;
+impl<'a> base::DiskPage for SlottedData<'a> {
+    const PAGE_KIND: u8 = base::PageKind::SlottedData as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
@@ -19,7 +19,7 @@ impl<'a> page_base::DiskPage for SlottedDataPage<'a> {
     }
 }
 
-impl<'a> SlottedDataPage<'a> {
+impl<'a> SlottedData<'a> {
     // === Memory layout ===
     //   0..  1 -> Page Kind  (u8)         -|
     //   4..  8 -> Free space (u32)         | Header (64 bytes)
@@ -31,9 +31,9 @@ impl<'a> SlottedDataPage<'a> {
     //  ...(slot offsets, slot lengths)
     //  ...data (from the end)
 
-    pub const fn new<'b: 'a>(raw: &'b mut page_base::PageBuf) -> Self {
+    pub const fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
         let mut page = Self { raw };
-        page.set_page_kind(page_base::PageKind::SlottedData);
+        page.set_page_kind(base::PageKind::SlottedData);
         page.set_free_space(constants::storage::PAGE_SIZE as u32 - 64 - 2);
 
         page
@@ -52,11 +52,11 @@ impl<'a> SlottedDataPage<'a> {
         }
     }
 
-    pub const fn page_id(&self) -> page_base::PageId {
+    pub const fn page_id(&self) -> base::PageId {
         unsafe {
             let ptr = self.raw.as_ptr().add(8) as *const u64;
             let val = u64::from_le(*ptr);
-            page_base::PageId::new(val).unwrap()
+            base::PageId::new(val).unwrap()
         }
     }
 
@@ -115,7 +115,7 @@ impl<'a> SlottedDataPage<'a> {
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: page_base::PageKind) {
+    const fn set_page_kind(&mut self, kind: base::PageKind) {
         self.raw[0] = kind as u8;
     }
 
@@ -126,7 +126,7 @@ impl<'a> SlottedDataPage<'a> {
         }
     }
 
-    pub const fn set_page_id(&mut self, id: page_base::PageId) {
+    pub const fn set_page_id(&mut self, id: base::PageId) {
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
             *ptr = id.get().to_le();

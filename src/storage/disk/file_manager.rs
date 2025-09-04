@@ -1,11 +1,8 @@
+use crate::constants;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-
-use crate::constants;
-use crate::storage::page::page_base;
 
 pub struct FileManager {
     file_path: String,

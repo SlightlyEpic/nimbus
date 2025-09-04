@@ -1,7 +1,7 @@
 use crate::constants;
 use crate::storage::buffer::Evictor;
 use crate::storage::disk;
-use crate::storage::page::{self, page_base};
+use crate::storage::page;
 use crate::storage::page_locator::{PageLocator, locator};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -14,30 +14,30 @@ pub struct Frame {
     ready: bool,
     pinned: bool,
     dirty: bool,
-    file_offset: u64,                 // can be garbage as long as is_ready is false
-    page_id: page_base::PageId, // redundant field for faster reads, can be garbage as long as is_ready is false
-    buf_ptr: *mut page_base::PageBuf, // raw pointer into frames_backing_buf
+    file_offset: u64,                  // can be garbage as long as is_ready is false
+    page_id: page::base::PageId, // redundant field for faster reads, can be garbage as long as is_ready is false
+    buf_ptr: *mut page::base::PageBuf, // raw pointer into frames_backing_buf
 }
 
 impl Frame {
     #[inline]
-    pub fn page_id(&self) -> page_base::PageId {
+    pub fn page_id(&self) -> page::base::PageId {
         self.page_id
     }
 
-    pub fn page_view(&mut self) -> page_base::Page<'_> {
+    pub fn page_view(&mut self) -> page::base::Page<'_> {
         unsafe {
             let buf = &mut (*self.buf_ptr);
-            let kind = page_base::page_kind_from_buf(buf);
+            let kind = page::base::page_kind_from_buf(buf);
 
             match kind {
-                page_base::PageKind::Directory => {
-                    page_base::Page::Directory(page::DirectoryPage::new(buf))
+                page::base::PageKind::Directory => {
+                    page::base::Page::Directory(page::Directory::new(buf))
                 }
-                page_base::PageKind::SlottedData => {
-                    page_base::Page::SlottedData(page::SlottedDataPage::new(buf))
+                page::base::PageKind::SlottedData => {
+                    page::base::Page::SlottedData(page::SlottedData::new(buf))
                 }
-                page_base::PageKind::Invalid => page_base::Page::Invalid(),
+                page::base::PageKind::Invalid => page::base::Page::Invalid(),
             }
         }
     }
@@ -61,7 +61,7 @@ impl Frame {
 #[derive(Copy, Clone)]
 struct FrameMeta {
     file_offset: u64,
-    page_id: page_base::PageId,
+    page_id: page::base::PageId,
     frame_id: u32,
 }
 
@@ -71,7 +71,7 @@ pub struct BufferPoolCore {
     frames: [Option<Frame>; FRAME_COUNT],
     free_frames: u32,
 
-    frames_meta_pid: HashMap<page_base::PageId, FrameMeta>,
+    frames_meta_pid: HashMap<page::base::PageId, FrameMeta>,
     frames_meta_offset: HashMap<u64, FrameMeta>,
 
     file_manager: disk::FileManager,
@@ -143,9 +143,9 @@ impl BufferPoolCore {
         frame.ready = true;
         frame.file_offset = offset;
         frame.page_id = match frame.page_view() {
-            page_base::Page::Directory(page) => page.page_id(),
-            page_base::Page::SlottedData(page) => page.page_id(),
-            page_base::Page::Invalid() => panic!("attempt to load invalid page"),
+            page::base::Page::Directory(page) => page.page_id(),
+            page::base::Page::SlottedData(page) => page.page_id(),
+            page::base::Page::Invalid() => panic!("attempt to load invalid page"),
         };
 
         let frame_meta = FrameMeta {
@@ -192,7 +192,7 @@ impl BufferPoolCore {
                 dirty: false,
                 pinned: false,
                 file_offset: 0,
-                page_id: page_base::PageId::new(1).unwrap(),
+                page_id: page::base::PageId::new(1).unwrap(),
                 buf_ptr: buf_ptr,
             };
 
@@ -234,14 +234,14 @@ impl BufferPoolCore {
     }
 
     /// NOTE: idx must be within 0..FRAME_COUNT
-    pub unsafe fn get_frame_buf_at(self: Pin<&mut Self>, idx: usize) -> *mut page_base::PageBuf {
+    pub unsafe fn get_frame_buf_at(self: Pin<&mut Self>, idx: usize) -> *mut page::base::PageBuf {
         let offset = idx * constants::storage::PAGE_SIZE;
         unsafe {
             self.get_unchecked_mut()
                 .frames_backing_buf
                 .as_mut_ptr()
                 .add(offset)
-                .cast::<page_base::PageBuf>()
+                .cast::<page::base::PageBuf>()
         }
     }
 }
@@ -278,7 +278,7 @@ impl BufferPool {
 
     pub fn fetch_page(
         mut self: Pin<&mut Self>,
-        page_id: page_base::PageId,
+        page_id: page::base::PageId,
     ) -> Result<&mut Frame, errors::FetchPageError> {
         let (core, locator) = unsafe {
             let this = self.as_mut().get_unchecked_mut();
