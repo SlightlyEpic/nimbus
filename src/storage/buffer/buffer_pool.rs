@@ -2,6 +2,7 @@ use crate::constants;
 use crate::storage::buffer::Evictor;
 use crate::storage::disk;
 use crate::storage::page::{self, page_base};
+use crate::storage::page_locator::{PageLocator, locator};
 use std::collections::HashMap;
 use std::pin::Pin;
 
@@ -13,6 +14,7 @@ pub struct Frame {
     ready: bool,
     pinned: bool,
     dirty: bool,
+    file_offset: u64,                 // can be garbage as long as is_ready is false
     page_id: page_base::PageId, // redundant field for faster reads, can be garbage as long as is_ready is false
     buf_ptr: *mut page_base::PageBuf, // raw pointer into frames_backing_buf
 }
@@ -56,35 +58,29 @@ impl Frame {
     }
 }
 
+#[derive(Copy, Clone)]
 struct FrameMeta {
     file_offset: u64,
+    page_id: page_base::PageId,
+    frame_id: u32,
 }
 
-pub struct BufferPool<E: Evictor> {
+pub struct BufferPoolCore {
+    // All original fields except page_locator
     frames_backing_buf: Box<[u8; FRAME_COUNT * constants::storage::PAGE_SIZE]>,
     frames: [Option<Frame>; FRAME_COUNT],
-    frames_meta: HashMap<page_base::PageId, FrameMeta>, // because each frame is uniquely identified by its page_id
     free_frames: u32,
 
+    frames_meta_pid: HashMap<page_base::PageId, FrameMeta>,
+    frames_meta_offset: HashMap<u64, FrameMeta>,
+
     file_manager: disk::FileManager,
-    evictor: E,
+    evictor: Box<dyn Evictor>,
 
     _pin: std::marker::PhantomPinned,
 }
 
-impl<E: Evictor> BufferPool<E> {
-    pub fn new(file_manager: disk::FileManager, evictor: E) -> Self {
-        Self {
-            frames_backing_buf: Box::new([0u8; FRAME_COUNT * constants::storage::PAGE_SIZE]),
-            frames: std::array::from_fn(|_| None),
-            file_manager,
-            free_frames: FRAME_COUNT as u32,
-            evictor,
-            frames_meta: HashMap::default(),
-            _pin: std::marker::PhantomPinned::default(),
-        }
-    }
-
+impl BufferPoolCore {
     pub fn mark_frame_dirty(self: Pin<&mut Self>, frame: &Frame) {
         unsafe {
             if let Some(f) = &mut self.get_unchecked_mut().frames[frame.fid as usize] {
@@ -93,46 +89,94 @@ impl<E: Evictor> BufferPool<E> {
         }
     }
 
-    pub fn fetch_page(self: Pin<&mut Self>, page_id: page_base::PageId) -> Result<&mut Frame, ()> {
-        // mark page dirty and then give it
-        todo!();
-    }
-
     pub fn fetch_page_at_offset(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         offset: u64,
     ) -> Result<&mut Frame, errors::FetchPageError> {
-        let self_mut_ref = unsafe { self.get_unchecked_mut() };
+        // is page is this offset already loaded?
+        let is_loaded = self.as_mut().frames_meta_offset.contains_key(&offset);
 
-        let frame_idx = self_mut_ref
+        // if yes then no need to load, return that frame
+        if is_loaded {
+            let frame_id = self
+                .as_mut()
+                .frames_meta_offset
+                .get(&offset)
+                .unwrap()
+                .frame_id;
+            let frame = unsafe {
+                self.get_unchecked_mut().frames[frame_id as usize]
+                    .as_mut()
+                    .unwrap()
+            };
+            return Ok(frame);
+        }
+
+        // if not then create a frame and load it
+        let frame_idx = self
+            .as_mut()
             .find_free_frame_with_evict()
             .ok_or(errors::FetchPageError::BufferFull)?;
 
-        let frame = self_mut_ref
+        let frame = self
+            .as_mut()
             .alloc_frame_at(frame_idx)
             .expect("frame to be allocated");
 
         let buf_ptr = frame.buf_ptr;
 
         unsafe {
-            self_mut_ref
+            self.as_mut()
+                .get_unchecked_mut()
                 .file_manager
                 .read_block_into(offset, &mut (*buf_ptr))
                 .map_err(|_| errors::FetchPageError::IOError)?;
         }
 
-        let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
+        let frame = unsafe {
+            self.as_mut().get_unchecked_mut().frames[frame_idx]
+                .as_mut()
+                .unwrap()
+        };
 
+        // fill in page specific details
         frame.ready = true;
-        self_mut_ref.evictor.notify_frame_alloc(frame);
-        self_mut_ref.evictor.set_frame_evictable(frame, true);
+        frame.file_offset = offset;
+        frame.page_id = match frame.page_view() {
+            page_base::Page::Directory(page) => page.page_id(),
+            page_base::Page::SlottedData(page) => page.page_id(),
+            page_base::Page::Invalid() => panic!("attempt to load invalid page"),
+        };
 
+        let frame_meta = FrameMeta {
+            frame_id: frame_idx as u32,
+            file_offset: frame.file_offset,
+            page_id: frame.page_id,
+        };
+        unsafe {
+            // bookkeeping
+            self.as_mut()
+                .get_unchecked_mut()
+                .frames_meta_pid
+                .insert(frame_meta.page_id, frame_meta);
+            self.as_mut()
+                .get_unchecked_mut()
+                .frames_meta_offset
+                .insert(frame_meta.file_offset, frame_meta);
+
+            let self_mut_ref = self.as_mut().get_unchecked_mut();
+            let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
+            // evictor bookkeeping
+            self_mut_ref.evictor.notify_frame_alloc(frame);
+            self_mut_ref.evictor.set_frame_evictable(frame, true);
+        }
+
+        let frame = unsafe { self.get_unchecked_mut().frames[frame_idx].as_mut().unwrap() };
         Ok(frame)
     }
 
-    /// SAFETY: must follow pinning rules
-    fn alloc_frame_at(
-        self: &mut Self,
+    pub fn alloc_frame_at(
+        mut self: Pin<&mut Self>,
         frame_idx: usize,
     ) -> Result<&mut Frame, errors::AllocFrameError> {
         if self.frames[frame_idx].is_some() {
@@ -140,41 +184,49 @@ impl<E: Evictor> BufferPool<E> {
         }
 
         unsafe {
-            let buf_ptr = self.get_frame_buf_at(frame_idx);
+            let buf_ptr = self.as_mut().get_frame_buf_at(frame_idx);
 
             let frame = Frame {
                 fid: frame_idx as u32,
                 ready: false,
                 dirty: false,
                 pinned: false,
+                file_offset: 0,
                 page_id: page_base::PageId::new(1).unwrap(),
                 buf_ptr: buf_ptr,
             };
 
-            Ok(self.frames[frame_idx].insert(frame))
+            Ok(self.get_unchecked_mut().frames[frame_idx].insert(frame))
         }
     }
 
-    /// SAFETY: must following pinning rules
-    fn dealloc_frame_at(self: &mut Self, frame_idx: usize) {
-        self.frames[frame_idx] = None;
-        self.evictor.notify_frame_destroy(frame_idx as u32);
-        self.free_frames += 1;
+    pub fn dealloc_frame_at(self: Pin<&mut Self>, frame_idx: usize) {
+        let self_mut = unsafe { self.get_unchecked_mut() };
+        let frame = self_mut.frames[frame_idx].unwrap();
+
+        self_mut.frames[frame_idx] = None;
+
+        // bookkeeping
+        self_mut.frames_meta_pid.remove(&frame.page_id);
+        self_mut.frames_meta_offset.remove(&frame.file_offset);
+        self_mut.free_frames += 1;
+
+        // evictor bookkeeping
+        self_mut.evictor.notify_frame_destroy(frame_idx as u32);
     }
 
-    /// SAFETY: must following pinning rules
-    fn find_free_frame_with_evict(self: &mut Self) -> Option<usize> {
-        let free_frames = self.free_frames;
+    pub fn find_free_frame_with_evict(mut self: Pin<&mut Self>) -> Option<usize> {
+        let self_mut = unsafe { self.as_mut().get_unchecked_mut() };
+        let free_frames = self_mut.free_frames;
         if free_frames == 0 {
-            let victim_frame_idx = self.evictor.pick_victim()?;
-            self.dealloc_frame_at(victim_frame_idx as usize);
+            let victim_frame_idx = self_mut.evictor.pick_victim()?;
+            self.as_mut().dealloc_frame_at(victim_frame_idx as usize);
         }
 
         self.frames.iter().position(|frame| frame.is_none())
     }
 
-    /// SAFETY: must following pinning rules
-    fn find_free_frame(self: &Self) -> Option<usize> {
+    pub fn find_free_frame(self: Pin<&Self>) -> Option<usize> {
         if self.free_frames == 0 {
             return None;
         }
@@ -182,15 +234,72 @@ impl<E: Evictor> BufferPool<E> {
     }
 
     /// NOTE: idx must be within 0..FRAME_COUNT
-    /// SAFETY: must follow pinning rules
-    unsafe fn get_frame_buf_at(self: &mut Self, idx: usize) -> *mut page_base::PageBuf {
+    pub unsafe fn get_frame_buf_at(self: Pin<&mut Self>, idx: usize) -> *mut page_base::PageBuf {
         let offset = idx * constants::storage::PAGE_SIZE;
         unsafe {
-            self.frames_backing_buf
+            self.get_unchecked_mut()
+                .frames_backing_buf
                 .as_mut_ptr()
                 .add(offset)
                 .cast::<page_base::PageBuf>()
         }
+    }
+}
+
+pub struct BufferPool {
+    core: BufferPoolCore,
+    page_locator: Box<dyn PageLocator>,
+}
+
+impl BufferPool {
+    pub fn new(
+        file_manager: disk::FileManager,
+        evictor: Box<dyn Evictor>,
+        page_locator: Box<dyn PageLocator>,
+    ) -> Self {
+        Self {
+            core: BufferPoolCore {
+                frames_backing_buf: Box::new([0u8; FRAME_COUNT * constants::storage::PAGE_SIZE]),
+                frames: std::array::from_fn(|_| None),
+                free_frames: FRAME_COUNT as u32,
+                frames_meta_pid: HashMap::new(),
+                frames_meta_offset: HashMap::new(),
+                file_manager,
+                evictor,
+                _pin: std::marker::PhantomPinned::default(),
+            },
+            page_locator,
+        }
+    }
+
+    fn core(self: Pin<&mut Self>) -> Pin<&mut BufferPoolCore> {
+        unsafe { self.map_unchecked_mut(|s| &mut s.core) }
+    }
+
+    pub fn fetch_page(
+        mut self: Pin<&mut Self>,
+        page_id: page_base::PageId,
+    ) -> Result<&mut Frame, errors::FetchPageError> {
+        let (core, locator) = unsafe {
+            let this = self.as_mut().get_unchecked_mut();
+            (Pin::new_unchecked(&mut this.core), &mut this.page_locator)
+        };
+
+        let offset_result = locator.find_file_offset(page_id, core);
+
+        let offset = offset_result.map_err(|err| match err {
+            locator::errors::FindOffsetError::NotFound => errors::FetchPageError::NotFound,
+            _ => errors::FetchPageError::IOError,
+        })?;
+
+        self.fetch_page_at_offset(offset)
+    }
+
+    pub fn fetch_page_at_offset(
+        self: Pin<&mut Self>,
+        offset: u64,
+    ) -> Result<&mut Frame, errors::FetchPageError> {
+        self.core().fetch_page_at_offset(offset)
     }
 }
 
@@ -204,10 +313,6 @@ pub mod errors {
     pub enum FetchPageError {
         BufferFull,
         IOError,
+        NotFound,
     }
 }
-
-// TODO:
-// Need to make something external to the buffer pool
-// which knows how to traverse the page directory (currently)
-// So that there can be other page lookup implementation later
