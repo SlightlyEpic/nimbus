@@ -1,6 +1,6 @@
 use crate::{
     constants,
-    storage::page::{directory::Directory, slotted_data::SlottedData},
+    storage::page::{bplus_inner::BPlusInner, directory::Directory, slotted_data::SlottedData},
 };
 use std::num::NonZeroU64;
 
@@ -11,6 +11,7 @@ pub enum PageKind {
     Invalid = 0,
     Directory = 1,
     SlottedData = 2,
+    BPlusInner = 3,
 }
 
 pub trait DiskPage {
@@ -26,6 +27,7 @@ pub enum Page<'a> {
     Invalid(),
     Directory(Directory<'a>),
     SlottedData(SlottedData<'a>),
+    BPlusInner(BPlusInner<'a>),
 }
 
 pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
@@ -33,6 +35,7 @@ pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
     match buf[0] {
         1 => PageKind::Directory,
         2 => PageKind::SlottedData,
+        3 => PageKind::BPlusInner,
         _ => PageKind::Invalid,
     }
 }
