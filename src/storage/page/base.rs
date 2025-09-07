@@ -12,6 +12,7 @@ pub enum PageKind {
     Directory = 1,
     SlottedData = 2,
     BPlusInner = 3,
+    BPlusLeaf = 4,
 }
 
 pub trait DiskPage {
@@ -28,6 +29,7 @@ pub enum Page<'a> {
     Directory(Directory<'a>),
     SlottedData(SlottedData<'a>),
     BPlusInner(BPlusInner<'a>),
+    BPlusLeaf(BPlusLeaf<'a>),
 }
 
 pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {

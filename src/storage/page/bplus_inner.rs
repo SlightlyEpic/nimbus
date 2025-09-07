@@ -8,31 +8,31 @@ impl<'a> base::DiskPage for BPlusInner<'a> {
     const PAGE_KIND: u8 = base::PageKind::BPlusInner as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
-        return &self.raw;
+        &self.raw
     }
 
     fn raw_mut(&mut self) -> &mut [u8; constants::storage::PAGE_SIZE] {
-        return &mut self.raw;
+        &mut self.raw
     }
 }
-
-const KEY_END_ADDR: usize = ((constants::storage::PAGE_SIZE - 64) / 2) + 64;
 
 impl<'a> BPlusInner<'a> {
     // === Memory layout ===
     //   0..  1     -> Page Kind                        (u8)   -|
-    //   1..  2     -> BPlus Node type (inner/leaf)     (u8)    |
-    //   2..  3     -> level                                    |
-    //   3..  4     -> num free slots                           |
-    //   4..  8     -> empty pageId vec offset          (u32)   |
-    //   8.. 16     -> Page Id                          (u64)   | Header (64 bytes)
-    //  16.. 32     -> prev sibling page id             (u64)   |
-    //  32.. 40     -> next sibling page id             (u64)   |
-    //  40.. 44     -> curr vec sz                      (u32)   |
-    //  44.. 64     -> empty                                   -|
-    //  64.. N      -> vec[u64: pageId]
-    //  N.. PAGE_SIZE -> vec[u64: children ptr() / record id(leaf)]
-    //  N = (PAGE_SIZE - 64) / 2
+    //   1..  2     -> Node Type                        (u8)    |
+    //   2..  3     -> Level                            (u8)    |
+    //   3..  4     -> Reserved                         (u8)    |
+    //   4..  8     -> Free Space (bytes)               (u32)   |
+    //   8.. 16     -> Page ID                         (u64)   | Header (64 bytes)
+    //  16.. 24     -> Prev Sibling Page ID            (u64)   |
+    //  24.. 32     -> Next Sibling Page ID            (u64)   |
+    //  32.. 36     -> Current Vector Size (num pairs) (u32)   |
+    //  36.. 40     -> Key Size                        (u32)   |
+    //  40.. 64     -> Reserved                                -|
+    //  64.. N      -> Keys growing forward: key0, key1, ... (each key_size bytes)
+    //  M.. PAGE_SIZE -> Values growing backward: value0 @ PAGE_SIZE-8, value1 @ PAGE_SIZE-16, etc. (each u64)
+    //  Free space between N and M.
+    //  Physical order of values in memory: value(n-1), ..., value0 (reversed logical order)
 
     pub const fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
         Self { raw }
@@ -50,7 +50,7 @@ impl<'a> BPlusInner<'a> {
         self.raw[2]
     }
 
-    pub const fn free_slots(&self) -> u32 {
+    pub const fn free_space(&self) -> u32 {
         unsafe {
             let ptr = self.raw.as_ptr().add(4) as *const u32;
             u32::from_le(*ptr)
@@ -75,7 +75,7 @@ impl<'a> BPlusInner<'a> {
 
     pub const fn next_sibling(&self) -> Option<base::PageId> {
         unsafe {
-            let ptr = self.raw.as_ptr().add(32) as *const u64;
+            let ptr = self.raw.as_ptr().add(24) as *const u64;
             let val = u64::from_le(*ptr);
             base::PageId::new(val)
         }
@@ -83,7 +83,14 @@ impl<'a> BPlusInner<'a> {
 
     pub const fn curr_vec_sz(&self) -> u32 {
         unsafe {
-            let ptr = self.raw.as_ptr().add(40) as *const u32;
+            let ptr = self.raw.as_ptr().add(32) as *const u32;
+            u32::from_le(*ptr)
+        }
+    }
+
+    pub const fn get_key_size(&self) -> u32 {
+        unsafe {
+            let ptr = self.raw.as_ptr().add(36) as *const u32;
             u32::from_le(*ptr)
         }
     }
@@ -132,7 +139,7 @@ impl<'a> BPlusInner<'a> {
 
     pub const fn set_next_sibling(&mut self, id: Option<base::PageId>) {
         unsafe {
-            let ptr = self.raw.as_mut_ptr().add(32) as *mut u64;
+            let ptr = self.raw.as_mut_ptr().add(24) as *mut u64;
             *ptr = match id {
                 Some(page_id) => page_id.get().to_le(),
                 None => 0,
@@ -142,81 +149,88 @@ impl<'a> BPlusInner<'a> {
 
     pub const fn set_curr_vec_sz(&mut self, size: u32) {
         unsafe {
-            let ptr = self.raw.as_mut_ptr().add(40) as *mut u32;
+            let ptr = self.raw.as_mut_ptr().add(32) as *mut u32;
             *ptr = size.to_le();
         }
     }
 
-    pub fn get_page_ids(&self) -> &[u64] {
+    const fn set_key_size(&mut self, key_size: u32) {
+        unsafe {
+            let ptr = self.raw.as_mut_ptr().add(36) as *mut u32;
+            *ptr = key_size.to_le();
+        }
+    }
+
+    /// Gets the slice of keys as raw bytes (concatenated).
+    pub fn get_keys(&self) -> &[u8] {
         let size = self.curr_vec_sz() as usize;
+        let key_size = self.get_key_size() as usize;
         let start = 64;
-        let end = start + size * core::mem::size_of::<u64>();
-        if end > KEY_END_ADDR {
-            panic!("Invalid page IDs vector size");
-        }
-        unsafe {
-            let ptr = self.raw.as_ptr().add(start) as *const u64;
-            core::slice::from_raw_parts(ptr, size)
-        }
-    }
-
-    pub fn get_value_ptrs(&self) -> &[u64] {
-        let size = self.curr_vec_sz() as usize;
-        let start = KEY_END_ADDR;
-        let end = start + size * core::mem::size_of::<u64>();
+        let end = start + size * key_size;
         if end > constants::storage::PAGE_SIZE {
-            panic!("Invalid Value pointers vector size");
+            panic!("Invalid keys vector size");
+        }
+        &self.raw[start..end]
+    }
+
+    /// Gets the vector of values (u64) in logical order.
+    pub fn get_value_ptrs(&self) -> Vec<u64> {
+        let size = self.curr_vec_sz() as usize;
+        if size == 0 {
+            return vec![];
+        }
+        let start = constants::storage::PAGE_SIZE - size * core::mem::size_of::<u64>();
+        let end = constants::storage::PAGE_SIZE;
+        if start >= end {
+            panic!("Invalid value pointers vector size");
         }
         unsafe {
             let ptr = self.raw.as_ptr().add(start) as *const u64;
-            core::slice::from_raw_parts(ptr, size)
+            let slice = core::slice::from_raw_parts(ptr, size);
+            slice.iter().rev().map(|&x| u64::from_le(x)).collect()
         }
     }
 
-    pub fn push_pair(&mut self, page_id: u64, value: u64) {
-        if self.free_slots() == 0 {
-            // need to return a conformation value if error than create a new page
-            panic!("No free slots available for additional key-value pair");
+    /// Pushes a key-value pair to the page.
+    pub fn push_pair(&mut self, key: &[u8], value: u64) {
+        let key_size = self.get_key_size() as u32;
+        if key.len() != key_size as usize {
+            panic!(
+                "Key size mismatch: expected {}, got {}",
+                key_size,
+                key.len()
+            );
+        }
+        let required_space = key_size + 8;
+        if self.free_space() < required_space {
+            panic!("Not enough space for additional key-value pair");
         }
 
         let curr_size = self.curr_vec_sz() as usize;
 
-        // ---- Key write ----
+        // Calculate current positions
         let keys_start = 64;
-        let new_keys_end = keys_start + (curr_size + 1) * core::mem::size_of::<u64>();
-        if new_keys_end > KEY_END_ADDR {
-            // need to return a conformation value if error than create a new page
-            panic!("No space for additional page ID");
-        }
+        let key_pos = keys_start + curr_size * (key_size as usize);
+        let values_low = constants::storage::PAGE_SIZE - curr_size * core::mem::size_of::<u64>();
+        let val_pos = values_low - core::mem::size_of::<u64>();
 
-        // ---- Value write ----
-        let vals_start = KEY_END_ADDR;
-        let new_vals_end = vals_start + (curr_size + 1) * core::mem::size_of::<u64>();
-        if new_vals_end > constants::storage::PAGE_SIZE {
-            // need to return a conformation value if error than create a new page
-            panic!("No space for additional value (child ptr / record id)");
+        // Check for overlap (redundant since free_space checks it)
+        if key_pos + (key_size as usize) > val_pos {
+            panic!("No space for additional key-value pair");
         }
 
         unsafe {
-            // Write key
-            let ptr_key = self
-                .raw
-                .as_mut_ptr()
-                .add(keys_start + curr_size * core::mem::size_of::<u64>())
-                as *mut u64;
-            *ptr_key = page_id.to_le();
+            // Write key (grow forward)
+            let ptr_key = self.raw.as_mut_ptr().add(key_pos);
+            core::ptr::copy_nonoverlapping(key.as_ptr(), ptr_key, key_size as usize);
 
-            // Write value
-            let ptr_val = self
-                .raw
-                .as_mut_ptr()
-                .add(vals_start + curr_size * core::mem::size_of::<u64>())
-                as *mut u64;
+            // Write value (grow backward)
+            let ptr_val = self.raw.as_mut_ptr().add(val_pos) as *mut u64;
             *ptr_val = value.to_le();
         }
 
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
-        self.set_free_space(self.free_slots() - 1);
+        self.set_free_space(self.free_space() - required_space);
     }
 }

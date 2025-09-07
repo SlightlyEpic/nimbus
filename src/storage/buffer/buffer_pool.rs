@@ -1,4 +1,5 @@
 use crate::constants;
+use crate::constants::storage::PAGE_SIZE;
 use crate::storage::buffer::Evictor;
 use crate::storage::disk;
 use crate::storage::page;
@@ -36,6 +37,9 @@ impl Frame {
                 }
                 page::base::PageKind::SlottedData => {
                     page::base::Page::SlottedData(page::SlottedData::new(buf))
+                }
+                page::base::PageKind::BPlusInner => {
+                    page::base::Page::BPlusInner(page::BPlusInner::new(buf))
                 }
                 page::base::PageKind::Invalid => page::base::Page::Invalid(),
             }
@@ -145,6 +149,7 @@ impl BufferPoolCore {
         frame.page_id = match frame.page_view() {
             page::base::Page::Directory(page) => page.page_id(),
             page::base::Page::SlottedData(page) => page.page_id(),
+            page::base::Page::BPlusInner(page) => page.page_id(),
             page::base::Page::Invalid() => panic!("attempt to load invalid page"),
         };
 
