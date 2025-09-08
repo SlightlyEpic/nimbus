@@ -1,11 +1,11 @@
 use crate::{constants, storage::page::base};
 
-pub struct BPlusInner<'a> {
+pub struct BPlusLeaf<'a> {
     raw: &'a mut base::PageBuf,
 }
 
-impl<'a> base::DiskPage for BPlusInner<'a> {
-    const PAGE_KIND: u8 = base::PageKind::BPlusInner as u8;
+impl<'a> base::DiskPage for BPlusLeaf<'a> {
+    const PAGE_KIND: u8 = base::PageKind::BPlusLeaf as u8;
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         &self.raw
@@ -16,18 +16,18 @@ impl<'a> base::DiskPage for BPlusInner<'a> {
     }
 }
 
-impl<'a> BPlusInner<'a> {
+impl<'a> BPlusLeaf<'a> {
     // === Memory layout ===
-    //   0..  1     -> Page Kind                        (u8)   -|
-    //   1..  3     -> Level                            (u16)    |
-    //   3..  4     -> Reserved                         (u8)    |
-    //   4..  8     -> Free Space (bytes)               (u32)   |
-    //   8.. 16     -> Page ID                         (u64)   | Header (64 bytes)
-    //  16.. 24     -> Prev Sibling Page ID            (u64)   |
-    //  24.. 32     -> Next Sibling Page ID            (u64)   |
-    //  32.. 36     -> Current Vector Size (num pairs) (u32)   |
-    //  36.. 40     -> Key Size                        (u32)   |
-    //  40.. 64     -> Reserved                                -|
+    //   0..  1     -> Page Kind                        (u8)  -|
+    //   1..  3     -> Level                            (u16)  |
+    //   3..  4     -> Reserved                         (u8)   |
+    //   4..  8     -> Free Space (bytes)               (u32)  |
+    //   8.. 16     -> Page ID                         (u64)  | Header (64 bytes)
+    //  16.. 24     -> Prev Sibling Page ID            (u64)  |
+    //  24.. 32     -> Next Sibling Page ID            (u64)  |
+    //  32.. 36     -> Current Vector Size (num pairs) (u32)  |
+    //  36.. 40     -> Key Size                        (u32)  |
+    //  40.. 64     -> Reserved                              -|
     //  64.. N      -> Keys growing forward: key0, key1, ... (each key_size bytes)
     //  M.. PAGE_SIZE -> Values growing backward: value0 @ PAGE_SIZE-8, value1 @ PAGE_SIZE-16, etc. (each u64)
     //  Free space between N and M.
@@ -41,12 +41,8 @@ impl<'a> BPlusInner<'a> {
             );
         }
         let mut result = Self { raw };
-        result.set_page_kind(base::PageKind::BPlusInner);
+        result.set_page_kind(base::PageKind::BPlusLeaf);
         result
-    }
-
-    pub const fn page_kind(&self) -> u8 {
-        self.raw[0]
     }
 
     pub fn page_level(&self) -> u16 {
@@ -205,42 +201,5 @@ impl<'a> BPlusInner<'a> {
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
         self.set_free_space(self.free_space() - required_space);
-    }
-
-    pub fn get_value(&self, key: &[u8]) -> Option<u64> {
-        let key_size = self.get_key_size() as usize;
-        if key.len() != key_size {
-            return None; // Key size mismatch
-        }
-
-        let num_pairs = self.curr_vec_sz() as usize;
-        let keys = self.get_keys();
-
-        // Binary search
-        let mut left = 0;
-        let mut right = num_pairs;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let key_start = mid * key_size;
-            let stored_key = &keys[key_start..key_start + key_size];
-
-            match stored_key.cmp(key) {
-                core::cmp::Ordering::Equal => {
-                    // Found the key, calculate corresponding value offset
-                    let value_idx = num_pairs - 1 - mid; // Reverse index for logical order
-                    let value_offset = constants::storage::PAGE_SIZE
-                        - (value_idx + 1) * core::mem::size_of::<u64>();
-                    let bytes = self.raw[value_offset..value_offset + core::mem::size_of::<u64>()]
-                        .try_into()
-                        .expect("Invalid value offset");
-                    return Some(u64::from_le_bytes(bytes));
-                }
-                core::cmp::Ordering::Less => left = mid + 1,
-                core::cmp::Ordering::Greater => right = mid,
-            }
-        }
-
-        None // Key not found
     }
 }
