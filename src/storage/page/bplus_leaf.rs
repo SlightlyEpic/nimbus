@@ -108,12 +108,8 @@ impl<'a> BPlusLeaf<'a> {
         self.raw[8..16].copy_from_slice(&id.get().to_le_bytes());
     }
 
-    pub fn set_level(&mut self, level: u8) {
-        self.raw[2] = level;
-    }
-
-    pub fn set_node_type(&mut self, node_type: u8) {
-        self.raw[1] = node_type;
+    pub fn set_level(&mut self, level: u16) {
+        self.raw[1..3].copy_from_slice(&level.to_le_bytes());
     }
 
     pub fn set_prev_sibling(&mut self, id: Option<base::PageId>) {
@@ -201,5 +197,42 @@ impl<'a> BPlusLeaf<'a> {
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
         self.set_free_space(self.free_space() - required_space);
+    }
+
+    pub fn get_value(&self, key: &[u8]) -> Option<u64> {
+        let key_size = self.get_key_size() as usize;
+        if key.len() != key_size {
+            return None; // Key size mismatch
+        }
+
+        let num_pairs = self.curr_vec_sz() as usize;
+        let keys = self.get_keys();
+
+        // Binary search
+        let mut left = 0;
+        let mut right = num_pairs;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let key_start = mid * key_size;
+            let stored_key = &keys[key_start..key_start + key_size];
+
+            match stored_key.cmp(key) {
+                core::cmp::Ordering::Equal => {
+                    // Found the key, calculate corresponding value offset
+                    let value_idx = mid;
+                    let value_offset = constants::storage::PAGE_SIZE
+                        - (value_idx + 1) * core::mem::size_of::<u64>();
+                    let bytes = self.raw[value_offset..value_offset + core::mem::size_of::<u64>()]
+                        .try_into()
+                        .expect("Invalid value offset");
+                    return Some(u64::from_le_bytes(bytes));
+                }
+                core::cmp::Ordering::Less => left = mid + 1,
+                core::cmp::Ordering::Greater => right = mid,
+            }
+        }
+
+        None // Key not found
     }
 }

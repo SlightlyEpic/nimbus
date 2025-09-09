@@ -112,12 +112,8 @@ impl<'a> BPlusInner<'a> {
         self.raw[8..16].copy_from_slice(&id.get().to_le_bytes());
     }
 
-    pub fn set_level(&mut self, level: u8) {
-        self.raw[2] = level;
-    }
-
-    pub fn set_node_type(&mut self, node_type: u8) {
-        self.raw[1] = node_type;
+    pub fn set_level(&mut self, level: u16) {
+        self.raw[1..3].copy_from_slice(&level.to_le_bytes());
     }
 
     pub fn set_prev_sibling(&mut self, id: Option<base::PageId>) {
@@ -228,7 +224,7 @@ impl<'a> BPlusInner<'a> {
             match stored_key.cmp(key) {
                 core::cmp::Ordering::Equal => {
                     // Found the key, calculate corresponding value offset
-                    let value_idx = num_pairs - 1 - mid; // Reverse index for logical order
+                    let value_idx = mid;
                     let value_offset = constants::storage::PAGE_SIZE
                         - (value_idx + 1) * core::mem::size_of::<u64>();
                     let bytes = self.raw[value_offset..value_offset + core::mem::size_of::<u64>()]
