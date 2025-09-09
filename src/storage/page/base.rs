@@ -1,6 +1,6 @@
 use crate::{
     constants,
-    storage::page::{bplus_inner::BPlusInner, directory::Directory, slotted_data::SlottedData},
+    storage::page::{BPlusInner, BPlusLeaf, Directory, SlottedData},
 };
 use std::num::NonZeroU64;
 
