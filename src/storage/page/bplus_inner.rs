@@ -18,16 +18,16 @@ impl<'a> base::DiskPage for BPlusInner<'a> {
 
 impl<'a> BPlusInner<'a> {
     // === Memory layout ===
-    //   0..  1     -> Page Kind                        (u8)   -|
-    //   1..  3     -> Level                            (u16)    |
-    //   3..  4     -> Reserved                         (u8)    |
-    //   4..  8     -> Free Space (bytes)               (u32)   |
+    //   0..  1     -> Page Kind                       (u8)   -|
+    //   1..  3     -> Level                           (u16)   |
+    //   3..  4     -> Reserved                        (u8)    |
+    //   4..  8     -> Free Space (bytes)              (u32)   |
     //   8.. 16     -> Page ID                         (u64)   | Header (64 bytes)
     //  16.. 24     -> Prev Sibling Page ID            (u64)   |
     //  24.. 32     -> Next Sibling Page ID            (u64)   |
     //  32.. 36     -> Current Vector Size (num pairs) (u32)   |
     //  36.. 40     -> Key Size                        (u32)   |
-    //  40.. 64     -> Reserved                                -|
+    //  40.. 64     -> Reserved                               -|
     //  64.. N      -> Keys growing forward: key0, key1, ... (each key_size bytes)
     //  M.. PAGE_SIZE -> Values growing backward: value0 @ PAGE_SIZE-8, value1 @ PAGE_SIZE-16, etc. (each u64)
     //  Free space between N and M.

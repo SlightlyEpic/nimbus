@@ -18,10 +18,10 @@ impl<'a> base::DiskPage for BPlusLeaf<'a> {
 
 impl<'a> BPlusLeaf<'a> {
     // === Memory layout ===
-    //   0..  1     -> Page Kind                        (u8)  -|
-    //   1..  3     -> Level                            (u16)  |
-    //   3..  4     -> Reserved                         (u8)   |
-    //   4..  8     -> Free Space (bytes)               (u32)  |
+    //   0..  1     -> Page Kind                       (u8)  -|
+    //   1..  3     -> Level                           (u16)  |
+    //   3..  4     -> Reserved                        (u8)   |
+    //   4..  8     -> Free Space (bytes)              (u32)  |
     //   8.. 16     -> Page ID                         (u64)  | Header (64 bytes)
     //  16.. 24     -> Prev Sibling Page ID            (u64)  |
     //  24.. 32     -> Next Sibling Page ID            (u64)  |
