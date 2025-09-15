@@ -1,6 +1,9 @@
 use crate::{
     constants,
-    storage::page::{bplus_inner::BPlusInner, directory::Directory, slotted_data::SlottedData},
+    storage::page::{
+        bplus_inner::BPlusInner, bplus_leaf::BPlusLeaf, directory::Directory,
+        slotted_data::SlottedData,
+    },
 };
 use std::num::NonZeroU64;
 
@@ -38,6 +41,7 @@ pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
         1 => PageKind::Directory,
         2 => PageKind::SlottedData,
         3 => PageKind::BPlusInner,
+        4 => PageKind::BPlusLeaf,
         _ => PageKind::Invalid,
     }
 }

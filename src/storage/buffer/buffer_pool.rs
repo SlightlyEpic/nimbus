@@ -41,6 +41,9 @@ impl Frame {
                 page::base::PageKind::BPlusInner => {
                     page::base::Page::BPlusInner(page::BPlusInner::new(buf))
                 }
+                page::base::PageKind::BPlusLeaf => {
+                    page::base::Page::BPlusLeaf(page::BPlusLeaf::new(buf))
+                }
                 page::base::PageKind::Invalid => page::base::Page::Invalid(),
             }
         }
@@ -150,6 +153,7 @@ impl BufferPoolCore {
             page::base::Page::Directory(page) => page.page_id(),
             page::base::Page::SlottedData(page) => page.page_id(),
             page::base::Page::BPlusInner(page) => page.page_id(),
+            page::base::Page::BPlusLeaf(page) => page.page_id(),
             page::base::Page::Invalid() => panic!("attempt to load invalid page"),
         };
 
@@ -277,7 +281,7 @@ impl BufferPool {
         }
     }
 
-    fn core(self: Pin<&mut Self>) -> Pin<&mut BufferPoolCore> {
+    pub fn core(self: Pin<&mut Self>) -> Pin<&mut BufferPoolCore> {
         unsafe { self.map_unchecked_mut(|s| &mut s.core) }
     }
 

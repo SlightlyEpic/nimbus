@@ -1,7 +1,12 @@
 pub mod base;
 pub mod bplus_inner;
+pub mod bplus_leaf;
+pub mod bplus_tree;
 pub mod directory;
 pub mod slotted_data;
 pub use bplus_inner::BPlusInner;
+pub use bplus_leaf::BPlusLeaf;
+pub use bplus_tree::BPlusTree;
+
 pub use directory::Directory;
 pub use slotted_data::SlottedData;
