@@ -1,5 +1,4 @@
 use crate::constants;
-use crate::constants::storage::PAGE_SIZE;
 use crate::storage::buffer::Evictor;
 use crate::storage::disk;
 use crate::storage::page;
