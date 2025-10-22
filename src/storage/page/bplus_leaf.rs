@@ -289,7 +289,9 @@ impl<'a> BPlusLeaf<'a> {
 
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
-        self.set_free_space(self.free_space() - (key_size as u32 + 8));
+
+        let free_space = self.free_space();
+        self.set_free_space(free_space - (key_size as u32 + 8));
     }
 
     /// Find the correct position to insert a key (maintaining sorted order)
@@ -361,8 +363,9 @@ impl<'a> BPlusLeaf<'a> {
 
             // Update metadata
             self.set_curr_vec_sz((curr_size - 1) as u32);
-            self.set_free_space(self.free_space() + (key_size as u32 + 8));
 
+            let free_space = self.free_space();
+            self.set_free_space(free_space + (key_size as u32 + 8));
             true
         } else {
             false
@@ -519,8 +522,9 @@ impl<'a> BPlusLeaf<'a> {
 
         // Remove from this leaf
         self.set_curr_vec_sz((curr_size - 1) as u32);
-        self.set_free_space(self.free_space() + (key_size as u32 + 8));
 
+        let free_space = self.free_space();
+        self.set_free_space(free_space + (key_size as u32 + 8));
         moved_key
     }
 
@@ -582,8 +586,8 @@ impl<'a> BPlusLeaf<'a> {
         }
 
         self.set_curr_vec_sz((curr_size - 1) as u32);
-        self.set_free_space(self.free_space() + (key_size as u32 + 8));
-
+        let free_space = self.free_space();
+        self.set_free_space(free_space + (key_size as u32 + 8));
         new_first_key
     }
 
@@ -635,7 +639,8 @@ impl<'a> BPlusLeaf<'a> {
 
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
-        self.set_free_space(self.free_space() - (key_size as u32 + 8));
+        let free_space = self.free_space();
+        self.set_free_space(free_space - (key_size as u32 + 8));
     }
 
     /// Merge all entries from another leaf into this one

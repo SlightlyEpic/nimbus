@@ -150,6 +150,18 @@ impl<'a> BPlusInner<'a> {
         )
     }
 
+    fn calculate_max_keys(&self) -> u32 {
+        let available_space = constants::storage::PAGE_SIZE - 64;
+        let space_per_entry = self.get_key_size() + 8; // key + child_id
+
+        (available_space / space_per_entry as usize) as u32
+    }
+
+    pub fn has_space_for_key(&self) -> bool {
+        let required_space = self.get_key_size() + 8; // key + child_id
+        self.free_space() >= required_space
+    }
+
     pub fn get_keys(&self) -> &[u8] {
         let size = self.curr_vec_sz() as usize;
         let key_size = self.get_key_size() as usize;
@@ -159,6 +171,19 @@ impl<'a> BPlusInner<'a> {
             panic!("Invalid keys vector size");
         }
         &self.raw[start..end]
+    }
+
+    pub fn get_key_at(&self, index: usize) -> Option<&[u8]> {
+        let num_keys = self.curr_vec_sz() as usize;
+        if index >= num_keys {
+            return None;
+        }
+
+        let key_size = self.get_key_size();
+        let keys = self.get_keys();
+        let key_start = index * key_size as usize;
+
+        Some(&keys[key_start..key_start + key_size as usize])
     }
 
     // Get all child page IDs, length = curr_vec_sz + 1
@@ -210,6 +235,85 @@ impl<'a> BPlusInner<'a> {
             .expect("Invalid chunk size");
 
         base::PageId::new(u64::from_le_bytes(bytes))
+    }
+
+    pub fn set_child_at(&mut self, index: usize, child_id: base::PageId) {
+        let num_keys = self.curr_vec_sz() as usize;
+        let num_children = num_keys + 1;
+        if index >= num_children {
+            panic!("set_child_at: index out of bounds");
+        }
+
+        let physical_index = num_children - 1 - index;
+        let offset =
+            constants::storage::PAGE_SIZE - (physical_index + 1) * core::mem::size_of::<u64>();
+
+        self.raw[offset..offset + core::mem::size_of::<u64>()]
+            .copy_from_slice(&child_id.get().to_le_bytes());
+    }
+
+    pub fn split_with_new_key(
+        &mut self,
+        key: &[u8],
+        child_id: base::PageId,
+        new_inner: &mut BPlusInner,
+    ) -> Vec<u8> {
+        let key_sz = self.get_key_size() as usize;
+        let curr_sz = self.curr_vec_sz() as usize;
+
+        new_inner.set_key_size(self.get_key_size());
+        new_inner.set_level(self.page_level());
+        new_inner.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
+        new_inner.set_curr_vec_sz(0);
+
+        // Create temporary vector of all entries (including new one)
+        let mut all_keys = Vec::new();
+        let mut all_children = self.get_child_ptrs(); // Logical order: child(0)...child(n)
+
+        // Find insertion position
+        let insert_pos = self.find_insert_position(key);
+
+        // Add existing keys
+        for i in 0..curr_sz {
+            all_keys.push(self.get_key_at(i).unwrap().to_vec());
+        }
+
+        // Insert new key and child
+        all_keys.insert(insert_pos, key.to_vec());
+        all_children.insert(insert_pos + 1, child_id);
+
+        // Find split point
+        let total_entries = all_keys.len();
+        let split_point = total_entries / 2; // This key will be pushed up
+
+        let split_key = all_keys[split_point].clone();
+
+        // Clear old node and rebuild with first half
+        self.set_curr_vec_sz(0);
+        self.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
+
+        // Add first child for old node
+        self.set_child_at(0, all_children[0]);
+
+        let old_free_space = self.free_space();
+        self.set_free_space(old_free_space - 8); // Account for first child ptr
+
+        for i in 0..split_point {
+            self.insert_sorted(&all_keys[i], all_children[i + 1]);
+        }
+
+        // Fill new node with second half
+        // The first child of the new node is the one *after* the split_key
+        new_inner.set_child_at(0, all_children[split_point + 1]);
+
+        let new_free_space = new_inner.free_space();
+        new_inner.set_free_space(new_free_space - 8);
+
+        for i in (split_point + 1)..total_entries {
+            new_inner.insert_sorted(&all_keys[i], all_children[i + 1]);
+        }
+
+        split_key
     }
 
     // Insert key and child ptr at given position, shifting keys and children arrays
