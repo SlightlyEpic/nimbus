@@ -36,3 +36,8 @@ pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
         _ => PageKind::Invalid,
     }
 }
+
+pub fn init_page_buf(buf: &mut PageBuf, kind: PageKind) {
+    buf[0] = kind as u8;
+    buf[1..64].fill(0);
+}

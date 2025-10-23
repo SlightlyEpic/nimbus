@@ -89,6 +89,83 @@ impl BufferPoolCore {
         }
     }
 
+    pub fn pin_frame(self: Pin<&mut Self>, frame_id: u32) -> Result<(), errors::PinFrameError> {
+        unsafe {
+            let self_mut = self.get_unchecked_mut();
+            if let Some(frame) = &mut self_mut.frames[frame_id as usize] {
+                if frame.pinned() {
+                    return Err(errors::PinFrameError::AlreadyPinned);
+                }
+                frame.pinned = true;
+                self_mut.evictor.set_frame_evictable(frame, false);
+                Ok(())
+            } else {
+                Err(errors::PinFrameError::FrameNotFound)
+            }
+        }
+    }
+
+    pub fn unpin_frame(self: Pin<&mut Self>, frame_id: u32) -> Result<(), errors::UnpinFrameError> {
+        unsafe {
+            let self_mut = self.get_unchecked_mut();
+            if let Some(frame) = &mut self_mut.frames[frame_id as usize] {
+                if !frame.pinned {
+                    return Err(errors::UnpinFrameError::NotPinned);
+                }
+
+                frame.pinned = false;
+                self_mut.evictor.set_frame_evictable(frame, true);
+
+                Ok(())
+            } else {
+                Err(errors::UnpinFrameError::FrameNotFound)
+            }
+        }
+    }
+
+    pub fn flush_frame(
+        mut self: Pin<&mut Self>,
+        frame_id: u32,
+    ) -> Result<(), errors::FlushFrameError> {
+        unsafe {
+            let self_mut = self.as_mut().get_unchecked_mut();
+            let frame = self_mut.frames[frame_id as usize]
+                .as_ref()
+                .ok_or(errors::FlushFrameError::FrameNotFound)?;
+
+            if !frame.dirty() {
+                return Ok(());
+            }
+
+            let buf_ptr = frame.buf_ptr;
+            let offset = frame.file_offset;
+
+            self_mut
+                .file_manager
+                .write_block_from(offset, &(*buf_ptr))
+                .map_err(|_| errors::FlushFrameError::IOError)?;
+
+            if let Some(frame) = &mut self_mut.frames[frame_id as usize] {
+                frame.dirty = false;
+            }
+
+            Ok(())
+        }
+    }
+
+    pub fn flush_all(mut self: Pin<&mut Self>) -> Result<(), errors::FlushAllError> {
+        for i in 0..FRAME_COUNT {
+            if let Some(frame) = self.as_ref().get_ref().frames[i] {
+                if frame.dirty {
+                    self.as_mut()
+                        .flush_frame(i as u32)
+                        .map_err(|_| errors::FlushAllError::IOError)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn fetch_page_at_offset(
         mut self: Pin<&mut Self>,
         offset: u64,
@@ -109,6 +186,7 @@ impl BufferPoolCore {
                     .as_mut()
                     .unwrap()
             };
+
             return Ok(frame);
         }
 
@@ -167,6 +245,83 @@ impl BufferPoolCore {
             let self_mut_ref = self.as_mut().get_unchecked_mut();
             let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
             // evictor bookkeeping
+            self_mut_ref.evictor.notify_frame_alloc(frame);
+            self_mut_ref.evictor.set_frame_evictable(frame, true);
+        }
+
+        let frame = unsafe { self.get_unchecked_mut().frames[frame_idx].as_mut().unwrap() };
+        Ok(frame)
+    }
+
+    pub fn alloc_new_page(
+        mut self: Pin<&mut Self>,
+        page_kind: page::base::PageKind,
+    ) -> Result<&mut Frame, errors::AllocNewPageError> {
+        let frame_idx = self
+            .as_mut()
+            .find_free_frame_with_evict()
+            .ok_or(errors::AllocNewPageError::BufferFull)?;
+
+        let frame = self
+            .as_mut()
+            .alloc_frame_at(frame_idx)
+            .map_err(|_| errors::AllocNewPageError::AllocError)?;
+
+        let buf_ptr = frame.buf_ptr;
+
+        let offset = unsafe {
+            self.as_mut()
+                .get_unchecked_mut()
+                .file_manager
+                .allocate_new_page_offset()
+                .map_err(|_| errors::AllocNewPageError::IOError)?
+        };
+
+        unsafe {
+            std::ptr::write_bytes(buf_ptr, 0, 1);
+        }
+
+        let frame = unsafe {
+            self.as_mut().get_unchecked_mut().frames[frame_idx]
+                .as_mut()
+                .unwrap()
+        };
+
+        frame.ready = true;
+        frame.file_offset = offset;
+        frame.dirty = true;
+
+        unsafe {
+            let buf = &mut (*buf_ptr);
+            page::base::init_page_buf(buf, page_kind);
+        }
+
+        frame.page_id = match frame.page_view() {
+            page::base::Page::Directory(page) => page.page_id(),
+            page::base::Page::SlottedData(page) => page.page_id(),
+            page::base::Page::Invalid() => {
+                return Err(errors::AllocNewPageError::InvalidPage);
+            }
+        };
+
+        let frame_meta = FrameMeta {
+            frame_id: frame_idx as u32,
+            file_offset: frame.file_offset,
+            page_id: frame.page_id,
+        };
+
+        unsafe {
+            self.as_mut()
+                .get_unchecked_mut()
+                .frames_meta_pid
+                .insert(frame_meta.page_id, frame_meta);
+            self.as_mut()
+                .get_unchecked_mut()
+                .frames_meta_offset
+                .insert(frame_meta.file_offset, frame_meta);
+
+            let self_mut_ref = self.as_mut().get_unchecked_mut();
+            let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
             self_mut_ref.evictor.notify_frame_alloc(frame);
             self_mut_ref.evictor.set_frame_evictable(frame, true);
         }
@@ -301,6 +456,33 @@ impl BufferPool {
     ) -> Result<&mut Frame, errors::FetchPageError> {
         self.core().fetch_page_at_offset(offset)
     }
+
+    pub fn alloc_new_page(
+        self: Pin<&mut Self>,
+        page_kind: page::base::PageKind,
+    ) -> Result<&mut Frame, errors::AllocNewPageError> {
+        self.core().alloc_new_page(page_kind)
+    }
+
+    pub fn pin_frame(self: Pin<&mut Self>, frame_id: u32) -> Result<(), errors::PinFrameError> {
+        self.core().pin_frame(frame_id)
+    }
+
+    pub fn unpin_frame(self: Pin<&mut Self>, frame_id: u32) -> Result<(), errors::UnpinFrameError> {
+        self.core().unpin_frame(frame_id)
+    }
+
+    pub fn flush_frame(self: Pin<&mut Self>, frame_id: u32) -> Result<(), errors::FlushFrameError> {
+        self.core().flush_frame(frame_id)
+    }
+
+    pub fn flush_all(self: Pin<&mut Self>) -> Result<(), errors::FlushAllError> {
+        self.core().flush_all()
+    }
+
+    pub fn mark_frame_dirty(self: Pin<&mut Self>, frame: &Frame) {
+        self.core().mark_frame_dirty(frame)
+    }
 }
 
 pub mod errors {
@@ -314,5 +496,44 @@ pub mod errors {
         BufferFull,
         IOError,
         NotFound,
+        AllocError,
+        InvalidPage,
+    }
+
+    #[derive(Debug)]
+    pub enum AllocNewPageError {
+        BufferFull,
+        IOError,
+        AllocError,
+        InvalidPage,
+    }
+
+    #[derive(Debug)]
+    pub enum PinFrameError {
+        FrameNotFound,
+        AlreadyPinned,
+    }
+
+    pub enum UnpinFrameError {
+        FrameNotFound,
+        NotPinned,
+    }
+
+    #[derive(Debug)]
+    pub enum FlushFrameError {
+        FrameNotFound,
+        IOError,
+    }
+
+    #[derive(Debug)]
+    pub enum FlushAllError {
+        IOError,
+    }
+
+    #[derive(Debug)]
+    pub enum DeallocFrameError {
+        FrameNotFound,
+        FramePinned,
+        FlushError,
     }
 }

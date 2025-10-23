@@ -49,4 +49,19 @@ impl FileManager {
 
         Ok(())
     }
+
+    // adds a new page to the file
+    pub fn allocate_new_page_offset(&mut self) -> io::Result<u64> {
+        // go to the end of the file hence it will be the offset
+        let current_size = self.file.seek(SeekFrom::End(0))?;
+
+        // calculate the size to be allocated
+        let target_size = current_size + constants::storage::PAGE_SIZE as u64;
+
+        // append to the target size
+        // WARNING TOFIX: can truncate the file if too large
+        self.file.set_len(target_size)?;
+
+        Ok(current_size)
+    }
 }
