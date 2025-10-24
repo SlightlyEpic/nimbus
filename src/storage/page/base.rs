@@ -37,6 +37,8 @@ pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
     }
 }
 
+/// initializes the raw buf_page
+/// zeros out all the values except the pagekind
 pub fn init_page_buf(buf: &mut PageBuf, kind: PageKind) {
     buf[0] = kind as u8;
     buf[1..64].fill(0);

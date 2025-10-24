@@ -64,5 +64,10 @@ impl Evictor for FifoEvictor {
         self.frames_meta.remove(&frame_id);
         self.fid_idx_map.remove(&frame_id);
         self.victim_queue.remove(queue_idx);
+
+        for i in queue_idx..self.victim_queue.len() {
+            let fid = self.victim_queue[i];
+            self.fid_idx_map.insert(fid, i);
+        }
     }
 }
