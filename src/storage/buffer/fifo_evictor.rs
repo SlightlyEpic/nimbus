@@ -47,6 +47,7 @@ impl Evictor for FifoEvictor {
         self.fid_idx_map
             .insert(frame_id, self.victim_queue.len() - 1);
 
+        // we are upadating the victims but not the metadata
         self.frames_meta.insert(
             frame_id,
             EvictorFrameMeta {

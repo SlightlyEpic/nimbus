@@ -367,7 +367,9 @@ impl BufferPoolCore {
                 buf_ptr: buf_ptr,
             };
 
-            Ok(self.get_unchecked_mut().frames[frame_idx].insert(frame))
+            let self_mut = self.get_unchecked_mut();
+            self_mut.free_frames -= 1;
+            Ok(self_mut.frames[frame_idx].insert(frame))
         }
     }
 
