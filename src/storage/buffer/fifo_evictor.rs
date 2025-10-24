@@ -46,6 +46,15 @@ impl Evictor for FifoEvictor {
         self.victim_queue.push_back(frame_id);
         self.fid_idx_map
             .insert(frame_id, self.victim_queue.len() - 1);
+
+        self.frames_meta.insert(
+            frame_id,
+            EvictorFrameMeta {
+                fid: frame_id,
+                evictable: false,
+                evicted: false,
+            },
+        );
     }
 
     fn set_frame_evictable(&mut self, frame: &Frame, evictable: bool) {
