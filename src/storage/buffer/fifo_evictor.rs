@@ -46,6 +46,16 @@ impl Evictor for FifoEvictor {
         self.victim_queue.push_back(frame_id);
         self.fid_idx_map
             .insert(frame_id, self.victim_queue.len() - 1);
+
+        // we are upadating the victims but not the metadata
+        self.frames_meta.insert(
+            frame_id,
+            EvictorFrameMeta {
+                fid: frame_id,
+                evictable: false,
+                evicted: false,
+            },
+        );
     }
 
     fn set_frame_evictable(&mut self, frame: &Frame, evictable: bool) {
@@ -64,5 +74,10 @@ impl Evictor for FifoEvictor {
         self.frames_meta.remove(&frame_id);
         self.fid_idx_map.remove(&frame_id);
         self.victim_queue.remove(queue_idx);
+
+        for i in queue_idx..self.victim_queue.len() {
+            let fid = self.victim_queue[i];
+            self.fid_idx_map.insert(fid, i);
+        }
     }
 }
