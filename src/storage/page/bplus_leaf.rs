@@ -1,3 +1,4 @@
+use crate::storage::bplus_tree::SplitResult;
 use crate::{constants, storage::page::base};
 
 pub struct BPlusLeaf<'a> {
@@ -169,8 +170,9 @@ impl<'a> BPlusLeaf<'a> {
             return vec![];
         }
 
-        // Values are stored in reverse order physically
-        // Physical: value(n-1), value(n-2), ..., value(0)
+        // Values are stored in reverse order physically:
+        // raw[PAGE_SIZE - 8 .. PAGE_SIZE] => value(n-1)
+        // raw[PAGE_SIZE - 16 .. PAGE_SIZE - 8] => value(n-2)
         // We want logical order: value(0), value(1), ..., value(n-1)
         let start = constants::storage::PAGE_SIZE - size * core::mem::size_of::<u64>();
         let end = constants::storage::PAGE_SIZE;
@@ -178,11 +180,16 @@ impl<'a> BPlusLeaf<'a> {
             panic!("Invalid value pointers vector size");
         }
 
+        let mut out = Vec::with_capacity(size);
         self.raw[start..end]
             .chunks_exact(core::mem::size_of::<u64>())
-            .rev() // Reverse to get logical order
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("Invalid chunk size")))
-            .collect()
+            .rev()
+            .for_each(|chunk| {
+                let arr: [u8; 8] = chunk.try_into().expect("Invalid chunk size");
+                out.push(u64::from_le_bytes(arr));
+            });
+
+        out
     }
 
     pub fn get_value(&self, key: &[u8]) -> Option<u64> {
@@ -198,8 +205,7 @@ impl<'a> BPlusLeaf<'a> {
 
         let keys = self.get_keys();
 
-        // Binary search
-        let mut left = 0;
+        let mut left = 0usize;
         let mut right = num_pairs;
 
         while left < right {
@@ -209,14 +215,24 @@ impl<'a> BPlusLeaf<'a> {
 
             match stored_key.cmp(key) {
                 core::cmp::Ordering::Equal => {
-                    // Found the key, get corresponding value
-                    // Physical index for value = (num_pairs - 1 - mid)
+                    // Found the key, compute the physical index of the corresponding value.
+                    // Physical storage of values is reversed: physical value vector
+                    // stores value(n-1), value(n-2), ..., value(0)
+                    // Logical index `mid` maps to physical index: (num_pairs - 1 - mid)
                     let physical_value_index = num_pairs - 1 - mid;
                     let value_offset = constants::storage::PAGE_SIZE
                         - (physical_value_index + 1) * core::mem::size_of::<u64>();
-                    let bytes = self.raw[value_offset..value_offset + core::mem::size_of::<u64>()]
+
+                    // Safety: ensure the slice is within bounds
+                    let end = value_offset + core::mem::size_of::<u64>();
+                    if end > constants::storage::PAGE_SIZE {
+                        // Corrupted page / invalid offsets
+                        return None;
+                    }
+
+                    let bytes: [u8; 8] = self.raw[value_offset..end]
                         .try_into()
-                        .expect("Invalid value offset");
+                        .expect("Invalid value bytes length");
                     return Some(u64::from_le_bytes(bytes));
                 }
                 core::cmp::Ordering::Less => left = mid + 1,
@@ -419,62 +435,67 @@ impl<'a> BPlusLeaf<'a> {
     }
 
     /// Split this leaf with a new key, distributing entries between old and new leaf
-    pub fn split_with_new_key(
+    pub fn split_and_get_new_entries(
         &mut self,
         key: &[u8],
         value: u64,
-        new_leaf: &mut BPlusLeaf,
-    ) -> Result<crate::storage::page::bplus_tree::SplitResult, &'static str> {
+    ) -> Result<(SplitResult, Vec<(Vec<u8>, u64)>), &'static str> {
         let key_size = self.get_key_size() as usize;
+        if key.len() != key_size {
+            return Err("split_and_get_new_entries: key length mismatch");
+        }
+
         let curr_size = self.curr_vec_sz() as usize;
 
-        // Set up new leaf
-        new_leaf.set_key_size(self.get_key_size());
-        new_leaf.set_level(self.page_level());
-        new_leaf.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
-        new_leaf.set_curr_vec_sz(0);
-
-        // Create temporary vector of all entries (including new one)
-        let mut all_entries = Vec::new();
-
-        // Add existing entries
-        let keys = self.get_keys();
-        let values = self.get_value_ptrs();
-
-        for i in 0..curr_size {
-            let key_start = i * key_size;
-            let existing_key = &keys[key_start..key_start + key_size];
-            all_entries.push((existing_key.to_vec(), values[i]));
+        // Build vector of all entries (logical order)
+        let mut all_entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(curr_size + 1);
+        {
+            let keys_buf = self.get_keys();
+            let values_vec = self.get_value_ptrs();
+            for i in 0..curr_size {
+                let ks = i * key_size;
+                all_entries.push((keys_buf[ks..ks + key_size].to_vec(), values_vec[i]));
+            }
         }
 
-        // Insert new entry in correct position
-        let insert_pos = all_entries
-            .iter()
-            .position(|(k, _)| k.as_slice() > key)
-            .unwrap_or(all_entries.len());
-        all_entries.insert(insert_pos, (key.to_vec(), value));
+        // Try to find existing key -> if found, update value (no duplicate)
+        if let Some(idx) = all_entries.iter().position(|(k, _)| k.as_slice() == key) {
+            all_entries[idx].1 = value;
+        } else {
+            // find insertion position (first key > new key)
+            let insert_pos = all_entries
+                .iter()
+                .position(|(k, _)| k.as_slice() > key)
+                .unwrap_or(all_entries.len());
+            all_entries.insert(insert_pos, (key.to_vec(), value));
+        }
 
-        // Split entries between old and new leaf
+        // Determine split point (even split; right side may have equal or +1 entries)
         let total_entries = all_entries.len();
-        let split_point = total_entries / 2;
+        if total_entries == 0 {
+            return Err("split_and_get_new_entries: no entries to split");
+        }
+        let split_point = total_entries / 2; // entries [0..split_point) -> left, [split_point..end) -> right
 
-        // Clear old leaf and rebuild with first half
+        // Rebuild left (this) leaf with first half
         self.set_curr_vec_sz(0);
-        self.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
-
+        self.set_free_space((constants::storage::PAGE_SIZE - 64) as u32);
         for i in 0..split_point {
-            self.insert_sorted(&all_entries[i].0, all_entries[i].1);
+            let (ref k, v) = all_entries[i];
+            self.insert_sorted(k, v);
         }
 
-        // Fill new leaf with second half
+        // Create vector for the new (right) leaf
+        let mut new_page_entries: Vec<(Vec<u8>, u64)> =
+            Vec::with_capacity(total_entries - split_point);
         for i in split_point..total_entries {
-            new_leaf.insert_sorted(&all_entries[i].0, all_entries[i].1);
+            new_page_entries.push(all_entries[i].clone());
         }
 
-        // Return the first key of the new leaf as split key
+        // split_key is the first key of the new (right) leaf
         let split_key = all_entries[split_point].0.clone();
 
-        Ok(crate::storage::page::bplus_tree::SplitResult { split_key })
+        Ok((SplitResult { split_key }, new_page_entries))
     }
 
     /// Get the first key in this leaf

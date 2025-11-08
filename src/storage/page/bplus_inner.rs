@@ -4,6 +4,12 @@ pub struct BPlusInner<'a> {
     raw: &'a mut base::PageBuf,
 }
 
+pub struct BPlusInnerSplitData {
+    pub key_to_push_up: Vec<u8>,
+    pub new_page_keys: Vec<Vec<u8>>,
+    pub new_page_children: Vec<base::PageId>,
+}
+
 impl<'a> base::DiskPage for BPlusInner<'a> {
     const PAGE_KIND: u8 = base::PageKind::BPlusInner as u8;
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
@@ -252,19 +258,12 @@ impl<'a> BPlusInner<'a> {
             .copy_from_slice(&child_id.get().to_le_bytes());
     }
 
-    pub fn split_with_new_key(
+    pub fn split_and_get_new_entries(
         &mut self,
         key: &[u8],
         child_id: base::PageId,
-        new_inner: &mut BPlusInner,
-    ) -> Vec<u8> {
-        let key_sz = self.get_key_size() as usize;
+    ) -> BPlusInnerSplitData {
         let curr_sz = self.curr_vec_sz() as usize;
-
-        new_inner.set_key_size(self.get_key_size());
-        new_inner.set_level(self.page_level());
-        new_inner.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
-        new_inner.set_curr_vec_sz(0);
 
         // Create temporary vector of all entries (including new one)
         let mut all_keys = Vec::new();
@@ -302,20 +301,23 @@ impl<'a> BPlusInner<'a> {
             self.insert_sorted(&all_keys[i], all_children[i + 1]);
         }
 
-        // Fill new node with second half
+        // Create vectors for the new (right) node
+        let mut new_page_keys = Vec::new();
+        let mut new_page_children = Vec::new();
+
         // The first child of the new node is the one *after* the split_key
-        new_inner.set_child_at(0, all_children[split_point + 1]);
-
-        let new_free_space = new_inner.free_space();
-        new_inner.set_free_space(new_free_space - 8);
-
+        new_page_children.push(all_children[split_point + 1]);
         for i in (split_point + 1)..total_entries {
-            new_inner.insert_sorted(&all_keys[i], all_children[i + 1]);
+            new_page_keys.push(all_keys[i].clone());
+            new_page_children.push(all_children[i + 1]);
         }
 
-        split_key
+        BPlusInnerSplitData {
+            key_to_push_up: split_key,
+            new_page_keys,
+            new_page_children,
+        }
     }
-
     // Insert key and child ptr at given position, shifting keys and children arrays
     pub fn insert_sorted(&mut self, key: &[u8], child_ptr: base::PageId) {
         let key_size = self.get_key_size() as usize;

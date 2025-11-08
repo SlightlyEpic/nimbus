@@ -6,7 +6,7 @@ use crate::storage::page_locator::{PageLocator, locator};
 use std::collections::HashMap;
 use std::pin::Pin;
 
-const FRAME_COUNT: usize = 128;
+pub const FRAME_COUNT: usize = 128;
 
 #[derive(Copy, Clone)]
 pub struct Frame {
@@ -66,6 +66,10 @@ impl Frame {
     #[inline]
     pub fn ready(&self) -> bool {
         self.ready
+    }
+    #[inline]
+    pub fn file_offset(&self) -> u64 {
+        self.file_offset
     }
 }
 
@@ -585,7 +589,7 @@ pub mod errors {
 }
 
 #[cfg(test)]
-mod tests {
+mod buffer_tests {
     use super::*;
     use crate::constants;
     use crate::storage::buffer::fifo_evictor::FifoEvictor;
