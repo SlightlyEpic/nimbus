@@ -195,7 +195,7 @@ impl<'a> BPlusLeaf<'a> {
     pub fn get_value(&self, key: &[u8]) -> Option<u64> {
         let key_size = self.get_key_size() as usize;
         if key.len() != key_size {
-            return None; // Key size mismatch
+            return None;
         }
 
         let num_pairs = self.curr_vec_sz() as usize;
@@ -215,24 +215,19 @@ impl<'a> BPlusLeaf<'a> {
 
             match stored_key.cmp(key) {
                 core::cmp::Ordering::Equal => {
-                    // Found the key, compute the physical index of the corresponding value.
-                    // Physical storage of values is reversed: physical value vector
-                    // stores value(n-1), value(n-2), ..., value(0)
-                    // Logical index `mid` maps to physical index: (num_pairs - 1 - mid)
                     let physical_value_index = num_pairs - 1 - mid;
                     let value_offset = constants::storage::PAGE_SIZE
                         - (physical_value_index + 1) * core::mem::size_of::<u64>();
 
-                    // Safety: ensure the slice is within bounds
                     let end = value_offset + core::mem::size_of::<u64>();
                     if end > constants::storage::PAGE_SIZE {
-                        // Corrupted page / invalid offsets
                         return None;
                     }
 
                     let bytes: [u8; 8] = self.raw[value_offset..end]
                         .try_into()
                         .expect("Invalid value bytes length");
+
                     return Some(u64::from_le_bytes(bytes));
                 }
                 core::cmp::Ordering::Less => left = mid + 1,
@@ -240,7 +235,7 @@ impl<'a> BPlusLeaf<'a> {
             }
         }
 
-        None // Key not found
+        None
     }
 
     /// Check if there's space for one more key-value pair
@@ -249,12 +244,24 @@ impl<'a> BPlusLeaf<'a> {
         self.free_space() >= required_space
     }
 
-    /// Insert key-value pair in sorted order
     pub fn insert_sorted(&mut self, key: &[u8], value: u64) {
         let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
 
-        // Find insertion position
+        if let Some(pos) = self.find_key_position(key) {
+            // Key already exists. Update its value.
+            // Physical storage of values is reversed
+            let physical_value_index = curr_size - 1 - pos;
+            let value_offset = constants::storage::PAGE_SIZE
+                - (physical_value_index + 1) * core::mem::size_of::<u64>();
+            let end = value_offset + core::mem::size_of::<u64>();
+
+            self.raw[value_offset..end].copy_from_slice(&value.to_le_bytes());
+            // No size or free space change, so we can return early.
+            return;
+        }
+
+        // Find insertion position (since key doesn't exist)
         let insert_pos = self.find_insert_position(key);
 
         // Shift existing keys right to make room
@@ -268,8 +275,6 @@ impl<'a> BPlusLeaf<'a> {
         }
 
         // Shift existing values right to make room
-        // Values are stored in reverse order, so we need to shift them right physically
-        // to make room for the new value at the correct logical position
         if insert_pos < curr_size {
             for i in (insert_pos..curr_size).rev() {
                 let src_physical_index = curr_size - 1 - i;
@@ -428,7 +433,7 @@ impl<'a> BPlusLeaf<'a> {
     }
 
     /// Calculate maximum number of keys this leaf can hold
-    fn calculate_max_keys(&self) -> u32 {
+    pub fn calculate_max_keys(&self) -> u32 {
         let available_space = constants::storage::PAGE_SIZE - 64; // Subtract header size
         let space_per_entry = self.get_key_size() + 8; // key + value
         (available_space / space_per_entry as usize) as u32

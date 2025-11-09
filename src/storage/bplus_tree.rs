@@ -71,6 +71,18 @@ impl BplusTree {
         self.root_page_id
     }
 
+    fn register_page(
+        &self,
+        page_id: PageId,
+        offset: u64,
+        mut bpm: Pin<&mut BufferPool>,
+        page_id_counter: &AtomicU64,
+    ) -> Result<(), BTreeError> {
+        bpm.as_mut()
+            .expand_directory_and_register(page_id, offset, 0, page_id_counter)
+            .map_err(|_| BTreeError::PageNotFound)
+    }
+
     /// Finds a value associated with a key.
     /// Manages pinning and unpinning of pages during traversal.
     pub fn find(
@@ -81,47 +93,33 @@ impl BplusTree {
         let mut current_page_id = self.root_page_id;
 
         loop {
-            // 1. Fetch the page from the buffer pool
             let frame = bpm.as_mut().fetch_page(current_page_id)?;
             let frame_id = frame.fid();
             let mut page_view = frame.page_view();
 
             let result = match &mut page_view {
-                // 2. If it's an inner page, find the next child to visit
                 Page::BPlusInner(inner_page) => {
                     if let Some(child_page_id) = inner_page.find_child_page(key) {
-                        // Set current_page_id for the next loop iteration
                         current_page_id = child_page_id;
-                        Ok(None) // Indicate traversal should continue
+                        Ok(None)
                     } else {
-                        // This should ideally not happen if the tree is valid
                         Err(BTreeError::PageNotFound)
                     }
                 }
-                // 3. If it's a leaf page, find the value
-                Page::BPlusLeaf(leaf_page) => {
-                    // We found the leaf, search for the key and return the value
-                    Ok(Some(leaf_page.get_value(key)))
-                }
-                _ => {
-                    // The page is not a valid B+ Tree page
-                    Err(BTreeError::InvalidPageType)
-                }
+                Page::BPlusLeaf(leaf_page) => Ok(Some(leaf_page.get_value(key))),
+                _ => Err(BTreeError::InvalidPageType),
             };
 
-            // 4. Unpin the current frame before the next loop or returning
             bpm.as_mut().unpin_frame(frame_id)?;
 
-            // 5. Handle the result from the match
             match result {
-                Ok(Some(value)) => return Ok(value), // Found in leaf, return value
-                Ok(None) => continue,                // Continue traversal
-                Err(e) => return Err(e),             // Error occurred
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => continue,
+                Err(e) => return Err(e),
             }
         }
     }
 
-    /// Inserts a key-value pair into the tree.
     pub fn insert(
         &mut self,
         key: &[u8],
@@ -129,24 +127,18 @@ impl BplusTree {
         mut bpm: Pin<&mut BufferPool>,
         page_id_counter: &AtomicU64,
     ) -> Result<(), BTreeError> {
-        // Start the recursive insertion from the root
         let split_result =
             self.insert_internal(self.root_page_id, key, value, bpm.as_mut(), page_id_counter)?;
 
-        // Check if the root itself was split
         if let SplitData::Split {
             key: new_key,
             right_page_id: new_child_page_id,
         } = split_result
         {
-            // The root split. We must create a new root page.
             let old_root_id = self.root_page_id;
-
-            // 1. Allocate a new page for the new root
             let new_root_id =
                 PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1).unwrap();
 
-            // Get level of old root *before* allocating new root
             let old_root_level = {
                 let old_root_frame = bpm.as_mut().fetch_page(old_root_id)?;
                 let level = match old_root_frame.page_view() {
@@ -159,40 +151,34 @@ impl BplusTree {
                 level
             };
 
-            // 2. Allocate and initialize new root
-            let new_root_frame_id = {
-                let new_root_frame = bpm
-                    .as_mut()
-                    .alloc_new_page(PageKind::BPlusInner, new_root_id)?;
-                let new_root_frame_id = new_root_frame.fid();
-                let mut new_root_page_view = new_root_frame.page_view();
-                let new_root_page = match &mut new_root_page_view {
-                    Page::BPlusInner(inner) => inner,
-                    _ => return Err(BTreeError::InvalidPageType),
-                };
+            let new_root_frame = bpm
+                .as_mut()
+                .alloc_new_page(PageKind::BPlusInner, new_root_id)?;
+            let new_root_frame_id = new_root_frame.fid();
+            let new_root_offset = new_root_frame.file_offset();
 
-                new_root_page.init(new_root_id, old_root_level + 1);
-                new_root_page.set_key_size(self.key_size);
-
-                // 3. Set its first child pointer to the *old* root
-                new_root_page.set_child_at(0, old_root_id);
-                let free_space = new_root_page.free_space();
-                new_root_page.set_free_space(free_space - 8); // Account for first child ptr
-
-                // 4. Insert the new key and the new child pointer
-                new_root_page.insert_sorted(&new_key, new_child_page_id);
-
-                bpm.as_mut().mark_frame_dirty(new_root_frame_id);
-                bpm.as_mut().unpin_frame(new_root_frame_id)?;
-                new_root_frame_id
+            let mut new_root_page_view = new_root_frame.page_view();
+            let new_root_page = match &mut new_root_page_view {
+                Page::BPlusInner(inner) => inner,
+                _ => return Err(BTreeError::InvalidPageType),
             };
 
-            // 5. Update the tree's root ID
+            new_root_page.init(new_root_id, old_root_level + 1);
+            new_root_page.set_key_size(self.key_size);
+            new_root_page.insert_sorted(&new_key, new_child_page_id);
+            new_root_page.set_child_at(0, old_root_id);
+
+            bpm.as_mut().mark_frame_dirty(new_root_frame_id);
+            bpm.as_mut().unpin_frame(new_root_frame_id)?;
+
+            self.register_page(new_root_id, new_root_offset, bpm.as_mut(), page_id_counter)?;
+
             self.root_page_id = new_root_id;
         }
 
         Ok(())
     }
+
     /// Recursive helper for insertion
     fn insert_internal(
         &mut self,
@@ -499,27 +485,17 @@ pub mod bplus_tests {
     // Add 'pub' to the module
     use super::*;
     use crate::constants;
+    use crate::storage::bplus_tree::BplusTree;
     use crate::storage::bplus_tree::buffer_pool::errors::FlushFrameError;
-    use crate::storage::buffer::BufferPoolCore;
     use crate::storage::buffer::fifo_evictor::FifoEvictor;
     use crate::storage::disk::FileManager;
+    use crate::storage::page::base::Page;
     use crate::storage::page::base::{PageId, PageKind};
-    use crate::storage::page_locator::locator::{self, PageLocator};
+    use crate::storage::page_locator::locator::{self};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     const FRAME_COUNT: usize = 128;
-    // Add 'pub'
-    pub struct MockPageLocator;
-    impl PageLocator for MockPageLocator {
-        fn find_file_offset(
-            &mut self,
-            _page_id: PageId,
-            _core: Pin<&mut BufferPoolCore>,
-        ) -> Result<u64, locator::errors::FindOffsetError> {
-            Err(locator::errors::FindOffsetError::NotFound)
-        }
-    }
 
     // Add 'pub'
     pub fn setup_buffer_pool_test(test_name: &str) -> (PathBuf, Pin<Box<BufferPool>>, AtomicU64) {
@@ -535,7 +511,7 @@ pub mod bplus_tests {
 
         let evictor = Box::new(FifoEvictor::new());
 
-        let page_locator = Box::new(MockPageLocator);
+        let page_locator = Box::new(locator::DirectoryPageLocator::new());
 
         let buffer_pool = Box::pin(BufferPool::new(file_manager, evictor, page_locator));
 
@@ -543,6 +519,46 @@ pub mod bplus_tests {
         // And PageId 1 will be the root.
         let page_id_cnt = AtomicU64::new(1);
         (temp_file_path, buffer_pool, page_id_cnt)
+    }
+    fn setup_bplus_tree_test(
+        test_name: &str,
+        key_size: u32,
+    ) -> (
+        BplusTree,
+        Pin<Box<crate::storage::buffer::BufferPool>>,
+        std::path::PathBuf,
+        std::sync::atomic::AtomicU64,
+    ) {
+        let (temp_path, mut buffer_pool, page_id_counter) = setup_buffer_pool_test(test_name);
+
+        // 1. Allocate the first page (root page)
+        // PageId 1 is the first one from the counter
+        let root_page_id = PageId::new(page_id_counter.load(Ordering::SeqCst)).unwrap();
+
+        let mut root_frame = buffer_pool
+            .as_mut()
+            .alloc_new_page(PageKind::BPlusLeaf, root_page_id)
+            .expect("Failed to allocate root page");
+
+        let root_frame_id = root_frame.fid();
+        let mut page_view = root_frame.page_view();
+        let root_page = match &mut page_view {
+            Page::BPlusLeaf(leaf) => leaf,
+            _ => panic!("Root page was not a leaf page"),
+        };
+
+        // 2. Initialize the root page
+        root_page.init(root_page_id);
+        root_page.set_key_size(key_size);
+
+        // 3. Mark dirty and unpin
+        buffer_pool.as_mut().mark_frame_dirty(root_frame_id);
+        buffer_pool.as_mut().unpin_frame(root_frame_id).unwrap();
+
+        // 4. Create the BplusTree struct
+        let btree = BplusTree::new(root_page_id, key_size);
+
+        (btree, buffer_pool, temp_path, page_id_counter)
     }
 
     // Add 'pub'
@@ -675,6 +691,11 @@ pub mod bplus_tests {
             }
 
             allocated_offsets.push(frame.file_offset());
+            let fid = frame.fid();
+            buffer_pool
+                .as_mut()
+                .unpin_frame(fid)
+                .expect("Unpin failed in loop");
         }
 
         // Flush all frames to ensure they can be evicted cleanly
@@ -769,8 +790,12 @@ pub mod bplus_tests {
                 crate::storage::page::base::Page::SlottedData(page) => page.set_page_id(page_id1),
                 _ => panic!("Expected SlottedData Page"),
             }
-
+            let fid = frame.fid();
             allocated_offsets.push(frame.file_offset());
+            buffer_pool
+                .as_mut()
+                .unpin_frame(fid)
+                .expect("Unpin failed in loop");
         }
 
         buffer_pool.as_mut().flush_all().expect("Flush all failed");
@@ -960,6 +985,281 @@ pub mod bplus_tests {
         // Directly call dealloc_frame_at (via BufferPoolCore) - This should panic
         let core = buffer_pool.as_mut().core();
         core.dealloc_frame_at(fid as usize); // This line should trigger the panic
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn test_btree_simple_insert_and_find() {
+        const KEY_SIZE: u32 = 8;
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("simple_insert_find", KEY_SIZE);
+
+        let key = 100u64.to_le_bytes();
+        let value = 12345u64;
+
+        // --- Insert ---
+        let insert_res = btree.insert(&key, value, buffer_pool.as_mut(), &page_id_counter);
+        assert!(insert_res.is_ok(), "Insert failed: {:?}", insert_res.err());
+
+        // --- Find ---
+        let find_res = btree.find(&key, buffer_pool.as_mut());
+        assert!(find_res.is_ok(), "Find failed: {:?}", find_res.err());
+
+        let found_val = find_res.unwrap();
+        assert!(found_val.is_some(), "Key not found after insert");
+        assert_eq!(found_val.unwrap(), value, "Value mismatch");
+
+        // --- Find non-existent key ---
+        let key_nonexist = 999u64.to_le_bytes();
+        let find_res_none = btree.find(&key_nonexist, buffer_pool.as_mut());
+        assert!(
+            find_res_none.is_ok(),
+            "Find (non-existent) failed: {:?}",
+            find_res_none.err()
+        );
+        assert!(
+            find_res_none.unwrap().is_none(),
+            "Found a key that should not exist"
+        );
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn test_btree_leaf_split() {
+        const KEY_SIZE: u32 = 8; // 8 byte key
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("leaf_split", KEY_SIZE);
+
+        let max_keys = {
+            let root_page_id = btree.get_root_page_id();
+            let frame = buffer_pool.as_mut().fetch_page(root_page_id).unwrap();
+            let mut page_view = frame.page_view(); // <-- FIX: added mut
+            let max = match &mut page_view {
+                // <-- FIX: added &mut
+                Page::BPlusLeaf(leaf) => leaf.calculate_max_keys(),
+                _ => panic!("Root is not leaf"),
+            };
+            let fr_id = frame.fid();
+            buffer_pool.as_mut().unpin_frame(fr_id).unwrap();
+            max as usize
+        };
+
+        let num_keys_to_insert = max_keys + 1;
+        let mut keys = Vec::new();
+
+        // --- Insert ---
+        for i in 0..num_keys_to_insert {
+            let key = (i as u64).to_le_bytes();
+            let value = (i as u64) * 10;
+            keys.push((key, value));
+
+            let insert_res = btree.insert(&key, value, buffer_pool.as_mut(), &page_id_counter);
+            assert!(
+                insert_res.is_ok(),
+                "Insert failed for key {}: {:?}",
+                i,
+                insert_res.err()
+            );
+        }
+
+        // --- Check that root page changed ---
+        // A leaf split should create a new root (an inner page).
+        let new_root_id = btree.get_root_page_id();
+        assert_ne!(
+            new_root_id.get(),
+            1,
+            "Root Page ID should have changed after a split"
+        );
+
+        // --- Find ---
+        // Verify all keys can be found
+        for (key, value) in keys {
+            let find_res = btree.find(&key, buffer_pool.as_mut());
+            assert!(
+                find_res.is_ok(),
+                "Find failed for key {:?}: {:?}",
+                key,
+                find_res.err()
+            );
+
+            let found_val = find_res.unwrap();
+            assert!(found_val.is_some(), "Key {:?} not found after split", key);
+            assert_eq!(
+                found_val.unwrap(),
+                value,
+                "Value mismatch for key {:?}",
+                key
+            );
+        }
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn test_btree_duplicate_insert() {
+        const KEY_SIZE: u32 = 8;
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("duplicate_insert", KEY_SIZE);
+
+        let key = 100u64.to_le_bytes();
+        let value1 = 12345u64;
+        let value2 = 67890u64;
+
+        // --- Insert first value ---
+        let insert_res1 = btree.insert(&key, value1, buffer_pool.as_mut(), &page_id_counter);
+        assert!(
+            insert_res1.is_ok(),
+            "Insert 1 failed: {:?}",
+            insert_res1.err()
+        );
+
+        // --- Find first value ---
+        let find_res1 = btree.find(&key, buffer_pool.as_mut()).unwrap().unwrap();
+        assert_eq!(find_res1, value1);
+
+        // --- Insert second value (update) ---
+        let insert_res2 = btree.insert(&key, value2, buffer_pool.as_mut(), &page_id_counter);
+        assert!(
+            insert_res2.is_ok(),
+            "Insert 2 failed: {:?}",
+            insert_res2.err()
+        );
+
+        // --- Find second value ---
+        let find_res2 = btree.find(&key, buffer_pool.as_mut()).unwrap().unwrap();
+        assert_eq!(
+            find_res2, value2,
+            "Value was not updated on duplicate insert"
+        );
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn test_btree_inner_page_split() {
+        const KEY_SIZE: u32 = 8; // 8 byte key
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("inner_split", KEY_SIZE);
+
+        // 1. Get max keys for leaf and inner pages
+        let (max_leaf_keys, max_inner_keys) = {
+            let root_page_id = btree.get_root_page_id();
+            let frame = buffer_pool.as_mut().fetch_page(root_page_id).unwrap();
+            let mut page_view = frame.page_view(); // <-- FIX: added mut
+            let leaf_max = match &mut page_view {
+                // <-- FIX: added &mut
+                Page::BPlusLeaf(leaf) => leaf.calculate_max_keys(),
+                _ => panic!("Root is not leaf"),
+            } as usize;
+
+            // We'll create a dummy buffer to calculate this
+            let mut dummy_buf = [0u8; constants::storage::PAGE_SIZE];
+            let mut inner_page = crate::storage::page::bplus_inner::BPlusInner::new(&mut dummy_buf);
+            inner_page.set_key_size(KEY_SIZE);
+            let inner_max = inner_page.calculate_max_keys() as usize;
+
+            let fr_id = frame.fid();
+            buffer_pool.as_mut().unpin_frame(fr_id).unwrap();
+            (leaf_max, inner_max)
+        };
+
+        // We need to trigger `max_inner_keys + 1` leaf splits to split the root inner page.
+        // Each leaf split happens after `max_leaf_keys` inserts.
+        // Let's use the split point, which is roughly max_keys / 2.
+        let keys_per_leaf_split = (max_leaf_keys / 2) + 1;
+        let num_leaf_splits_needed = max_inner_keys + 1;
+        let num_keys_to_insert = keys_per_leaf_split * num_leaf_splits_needed + 1;
+
+        println!(
+            "Test config: max_leaf_keys={}, max_inner_keys={}",
+            max_leaf_keys, max_inner_keys
+        );
+        println!(
+            "Inserting {} keys to trigger inner page split...",
+            num_keys_to_insert
+        );
+
+        let mut keys = Vec::new();
+
+        // --- Insert ---
+        for i in 0..num_keys_to_insert {
+            let key = (i as u64).to_le_bytes();
+            let value = (i as u64) * 10;
+            keys.push((key, value));
+
+            let insert_res = btree.insert(&key, value, buffer_pool.as_mut(), &page_id_counter);
+            if insert_res.is_err() {
+                panic!("Insert failed for key {}: {:?}", i, insert_res.err());
+            }
+        }
+
+        // --- Check tree height ---
+        // Original root (Page 1) was height 0.
+        // First split creates root (Page 2, inner) at height 1.
+        // Inner split creates root (Page N) at height 2.
+        let root_id = btree.get_root_page_id();
+        let root_frame = buffer_pool.as_mut().fetch_page(root_id).unwrap();
+        let root_height = match root_frame.page_view() {
+            Page::BPlusInner(inner) => inner.page_level(),
+            _ => panic!("Root page is not an inner page after inner split"),
+        };
+        let fr_id = root_frame.fid();
+        buffer_pool.as_mut().unpin_frame(fr_id).unwrap();
+
+        assert_eq!(
+            root_height, 2,
+            "Tree height should be 2 after inner page split"
+        );
+
+        // --- Find ---
+        // Verify all keys can be found
+        println!("Verifying {} keys...", keys.len());
+        for (key, value) in keys {
+            let find_res = btree.find(&key, buffer_pool.as_mut());
+            let found_val = find_res.unwrap();
+            assert!(
+                found_val.is_some(),
+                "Key {:?} not found after inner split",
+                key
+            );
+            assert_eq!(
+                found_val.unwrap(),
+                value,
+                "Value mismatch for key {:?}",
+                key
+            );
+        }
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
+    fn test_btree_insert_sequential() {
+        const KEY_SIZE: u32 = 8;
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("insert_sequential", KEY_SIZE);
+
+        let num_keys = 1000;
+        let mut keys = Vec::new();
+
+        // --- Insert ---
+        for i in 0..num_keys {
+            let key = (i as u64).to_le_bytes();
+            let value = (i as u64) * 10;
+            keys.push((key, value));
+            btree
+                .insert(&key, value, buffer_pool.as_mut(), &page_id_counter)
+                .unwrap();
+        }
+
+        // --- Find ---
+        for (key, value) in keys {
+            let find_res = btree.find(&key, buffer_pool.as_mut()).unwrap();
+            assert!(find_res.is_some(), "Key not found: {:?}", key);
+            assert_eq!(find_res.unwrap(), value, "Value mismatch: {:?}", key);
+        }
 
         cleanup_temp_file(&temp_path);
     }

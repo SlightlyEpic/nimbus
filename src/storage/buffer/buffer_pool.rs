@@ -351,7 +351,8 @@ impl BufferPoolCore {
             let self_mut_ref = self.as_mut().get_unchecked_mut();
             let frame = self_mut_ref.frames[frame_idx].as_mut().unwrap();
             self_mut_ref.evictor.notify_frame_alloc(frame);
-            self_mut_ref.evictor.set_frame_evictable(frame, true);
+            frame.pin_count = 1;
+            self_mut_ref.evictor.set_frame_evictable(frame, false);
         }
 
         let frame = unsafe { self.get_unchecked_mut().frames[frame_idx].as_mut().unwrap() };
@@ -483,6 +484,25 @@ impl BufferPool {
         mut self: Pin<&mut Self>,
         page_id: page::base::PageId,
     ) -> Result<&mut Frame, errors::FetchPageError> {
+        let frame_id = self
+            .as_ref()
+            .get_ref()
+            .core
+            .frames_meta_pid
+            .get(&page_id)
+            .map(|meta| meta.frame_id);
+
+        if let Some(fid) = frame_id {
+            // It's in the cache. Pin it and return the frame.
+            self.as_mut()
+                .pin_frame(fid)
+                .map_err(|_| errors::FetchPageError::InvalidPage)?; // Should not fail
+            return Ok(unsafe {
+                self.get_unchecked_mut().core.frames[fid as usize]
+                    .as_mut()
+                    .unwrap()
+            });
+        }
         let (core, locator) = unsafe {
             let this = self.as_mut().get_unchecked_mut();
             (Pin::new_unchecked(&mut this.core), &mut this.page_locator)
@@ -531,6 +551,183 @@ impl BufferPool {
 
     pub fn mark_frame_dirty(self: Pin<&mut Self>, frame_id: u32) {
         self.core().mark_frame_dirty(frame_id)
+    }
+
+    pub fn register_page_in_directory(
+        mut self: Pin<&mut Self>,
+        page_id: page::base::PageId,
+        file_offset: u64,
+        free_space: u32,
+    ) -> Result<(), String> {
+        let (core, locator) = unsafe {
+            let this = self.as_mut().get_unchecked_mut();
+            (Pin::new_unchecked(&mut this.core), &mut this.page_locator)
+        };
+
+        locator
+            .register_page(page_id, file_offset, free_space, core)
+            .map_err(|e| format!("Failed to register page: {:?}", e))
+    }
+
+    pub fn expand_directory_and_register(
+        mut self: Pin<&mut Self>,
+        page_id: page::base::PageId,
+        file_offset: u64,
+        free_space: u32,
+        page_id_counter: &std::sync::atomic::AtomicU64,
+    ) -> Result<(), String> {
+        use crate::storage::page_locator::locator::errors::RegisterPageError;
+        use std::sync::atomic::Ordering;
+
+        // Try to register first
+        let (core, locator) = unsafe {
+            let this = self.as_mut().get_unchecked_mut();
+            (Pin::new_unchecked(&mut this.core), &mut this.page_locator)
+        };
+
+        match locator.register_page(page_id, file_offset, free_space, core) {
+            Ok(()) => return Ok(()),
+            Err(RegisterPageError::DirectoryFull) => {
+                // Need to create a new directory page
+                let new_dir_id =
+                    page::base::PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1)
+                        .ok_or("Invalid page ID")?;
+
+                // Allocate new directory page
+                let new_dir_frame = self
+                    .as_mut()
+                    .alloc_new_page(page::base::PageKind::Directory, new_dir_id)
+                    .map_err(|e| format!("Failed to allocate directory page: {:?}", e))?;
+
+                let new_dir_offset = new_dir_frame.file_offset();
+                let new_dir_frame_id = new_dir_frame.fid();
+
+                let mut dir_page_view = new_dir_frame.page_view();
+                if let page::base::Page::Directory(dir_page) = &mut dir_page_view {
+                    dir_page.set_page_id(new_dir_id);
+                }
+
+                self.as_mut().mark_frame_dirty(new_dir_frame_id);
+                self.as_mut()
+                    .unpin_frame(new_dir_frame_id)
+                    .map_err(|e| format!("Failed to unpin directory: {:?}", e))?;
+
+                // Link new directory page to the chain
+                self.as_mut()
+                    .link_new_directory_page(new_dir_id, new_dir_offset)?;
+
+                // Register the new directory page itself
+                self.as_mut()
+                    .register_page_in_directory(new_dir_id, new_dir_offset, 0)?;
+
+                // Now retry registering the original page
+                self.as_mut()
+                    .register_page_in_directory(page_id, file_offset, free_space)
+            }
+            Err(e) => Err(format!("Failed to register page: {:?}", e)),
+        }
+    }
+
+    fn link_new_directory_page(
+        mut self: Pin<&mut Self>,
+        new_dir_id: page::base::PageId,
+        new_dir_offset: u64,
+    ) -> Result<(), String> {
+        // Find the last directory page and update its next pointer
+        let mut curr_offset = 0u64;
+        let mut last_dir_frame_id = None;
+        let mut last_dir_offset = 0u64;
+
+        loop {
+            let frame = self
+                .as_mut()
+                .fetch_page_at_offset(curr_offset)
+                .map_err(|e| format!("Failed to fetch directory: {:?}", e))?;
+
+            let frame_id = frame.fid();
+            let mut page_view = frame.page_view();
+
+            if let page::base::Page::Directory(dir_page) = &mut page_view {
+                if let Some(next_page_id) = dir_page.next_directory_page_id() {
+                    // Find next offset
+                    let num_entries = dir_page.num_entries();
+                    let mut next_offset = None;
+                    for i in 0..num_entries {
+                        if let Some(entry_page_id) = dir_page.entry_page_id(i as usize) {
+                            if entry_page_id == next_page_id {
+                                next_offset =
+                                    dir_page.entry_file_offset(i as usize).map(|o| o.get());
+                                break;
+                            }
+                        }
+                    }
+
+                    self.as_mut()
+                        .unpin_frame(frame_id)
+                        .map_err(|e| format!("Failed to unpin: {:?}", e))?;
+
+                    if let Some(offset) = next_offset {
+                        curr_offset = offset;
+                    } else {
+                        return Err("Corrupted directory chain".to_string());
+                    }
+                } else {
+                    // This is the last directory page
+                    last_dir_frame_id = Some(frame_id);
+                    last_dir_offset = curr_offset;
+                    break;
+                }
+            } else {
+                self.as_mut()
+                    .unpin_frame(frame_id)
+                    .map_err(|e| format!("Failed to unpin: {:?}", e))?;
+                return Err("Invalid directory page".to_string());
+            }
+        }
+
+        // Update the last directory page
+        if let Some(frame_id) = last_dir_frame_id {
+            let frame = self
+                .as_mut()
+                .fetch_page_at_offset(last_dir_offset)
+                .map_err(|e| format!("Failed to fetch last directory: {:?}", e))?;
+
+            let frame_id = frame.fid();
+            let mut page_view = frame.page_view();
+
+            if let page::base::Page::Directory(dir_page) = &mut page_view {
+                dir_page.set_next_directory_page_id(
+                    std::num::NonZeroU64::new(new_dir_id.get()).ok_or("Invalid directory ID")?,
+                );
+
+                // Also add entry for the new directory page
+                use crate::storage::page::directory::DirectoryEntry;
+                let entry = DirectoryEntry {
+                    page_id: new_dir_id,
+                    file_offset: std::num::NonZeroU64::new(new_dir_offset)
+                        .ok_or("Invalid offset")?,
+                    free_space: 0,
+                };
+
+                dir_page
+                    .add_entry(entry)
+                    .map_err(|_| "Failed to add directory entry")?;
+
+                self.as_mut().mark_frame_dirty(frame_id);
+                self.as_mut()
+                    .unpin_frame(frame_id)
+                    .map_err(|e| format!("Failed to unpin: {:?}", e))?;
+
+                Ok(())
+            } else {
+                self.as_mut()
+                    .unpin_frame(frame_id)
+                    .map_err(|e| format!("Failed to unpin: {:?}", e))?;
+                Err("Invalid directory page".to_string())
+            }
+        } else {
+            Err("Could not find last directory page".to_string())
+        }
     }
 }
 
@@ -601,17 +798,6 @@ mod buffer_tests {
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct MockPageLocator;
-    impl PageLocator for MockPageLocator {
-        fn find_file_offset(
-            &mut self,
-            _page_id: PageId,
-            _core: Pin<&mut BufferPoolCore>,
-        ) -> Result<u64, locator::errors::FindOffsetError> {
-            Err(locator::errors::FindOffsetError::NotFound)
-        }
-    }
-
     fn setup_buffer_pool_test(test_name: &str) -> (PathBuf, Pin<Box<BufferPool>>, AtomicU64) {
         let mut temp_dir = std::env::temp_dir();
         temp_dir.push(format!("nimbus_test_{}.db", test_name));
@@ -625,15 +811,14 @@ mod buffer_tests {
 
         let evictor = Box::new(FifoEvictor::new());
 
-        let page_locator = Box::new(MockPageLocator);
-
+        let page_locator = Box::new(locator::DirectoryPageLocator::new());
         let buffer_pool = Box::pin(BufferPool::new(file_manager, evictor, page_locator));
 
         let page_id_cnt = AtomicU64::new(0);
         (temp_file_path, buffer_pool, page_id_cnt)
     }
 
-    fn generate_test_page_id(counter: &AtomicU64) -> PageId {
+    pub fn generate_test_page_id(counter: &AtomicU64) -> PageId {
         // ID start from 1.
         let next_id = counter.fetch_add(1, Ordering::SeqCst) + 1;
         PageId::new(next_id).expect("Page ID counter overflowed in test")
@@ -665,7 +850,10 @@ mod buffer_tests {
             _ => panic!("Expected SlottedData Page"),
         }
         assert_eq!(offset1, 0);
-
+        buffer_pool
+            .as_mut()
+            .unpin_frame(frame_id1)
+            .expect("Unpin failed");
         // fetch the same page again by offset
         let frame2_result = buffer_pool.as_mut().fetch_page_at_offset(offset1);
         assert!(
@@ -754,6 +942,7 @@ mod buffer_tests {
                 .alloc_new_page(PageKind::SlottedData, page_id)
                 .expect(&format!("Failed to alloc page {}", i));
 
+            let frame_id = frame.fid();
             let mut page_view = frame.page_view();
             match &mut page_view {
                 page::base::Page::SlottedData(page) => page.set_page_id(page_id),
@@ -761,6 +950,10 @@ mod buffer_tests {
             }
 
             allocated_offsets.push(frame.file_offset);
+            buffer_pool
+                .as_mut()
+                .unpin_frame(frame_id)
+                .expect("Unpin failed in loop");
         }
 
         // Flush all frames to ensure they can be evicted cleanly
@@ -784,7 +977,7 @@ mod buffer_tests {
             _ => panic!("Expected SlottedData Page"),
         }
 
-        let extra_offset = extra_frame.file_offset;
+        let extra_offset = extra_frame.file_offset();
 
         // Check that the first allocated page was evicted
         // by fetching it again - it should be re-read from disk
@@ -850,6 +1043,7 @@ mod buffer_tests {
                 .expect(&format!("Failed to alloc page {}", i));
 
             // Set the page_id in the actual page buffer (needed for flushing)
+            let frame_id = frame.fid();
             let mut page_view = frame.page_view();
             match &mut page_view {
                 page::base::Page::SlottedData(page) => page.set_page_id(page_id1),
@@ -857,6 +1051,10 @@ mod buffer_tests {
             }
 
             allocated_offsets.push(frame.file_offset);
+            buffer_pool
+                .as_mut()
+                .unpin_frame(frame_id)
+                .expect("Unpin failed in loop");
         }
 
         buffer_pool.as_mut().flush_all().expect("Flush all failed");
@@ -920,6 +1118,7 @@ mod buffer_tests {
             fid1 = frame1.fid();
             offset1 = frame1.file_offset;
             assert!(frame1.dirty(), "Frame 1 should start dirty");
+            buffer_pool.as_mut().unpin_frame(fid1).unwrap();
         }
         buffer_pool
             .as_mut()
@@ -986,6 +1185,7 @@ mod buffer_tests {
             fid = frame.fid();
             offset = frame.file_offset;
             assert!(frame.dirty());
+            buffer_pool.as_mut().unpin_frame(fid).unwrap();
         }
 
         // Flush it to make it clean

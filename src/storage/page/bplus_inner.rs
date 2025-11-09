@@ -156,7 +156,7 @@ impl<'a> BPlusInner<'a> {
         )
     }
 
-    fn calculate_max_keys(&self) -> u32 {
+    pub fn calculate_max_keys(&self) -> u32 {
         let available_space = constants::storage::PAGE_SIZE - 64;
         let space_per_entry = self.get_key_size() + 8; // key + child_id
 
@@ -291,15 +291,10 @@ impl<'a> BPlusInner<'a> {
         self.set_curr_vec_sz(0);
         self.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
 
-        // Add first child for old node
-        self.set_child_at(0, all_children[0]);
-
-        let old_free_space = self.free_space();
-        self.set_free_space(old_free_space - 8); // Account for first child ptr
-
         for i in 0..split_point {
             self.insert_sorted(&all_keys[i], all_children[i + 1]);
         }
+        self.set_child_at(0, all_children[0]);
 
         // Create vectors for the new (right) node
         let mut new_page_keys = Vec::new();
@@ -344,27 +339,29 @@ impl<'a> BPlusInner<'a> {
         let curr_children = curr_size + 1;
         let new_children = curr_children + 1;
 
-        // Shift existing pointers that come after the insertion point
-        for i in (insert_pos + 2..new_children).rev() {
-            let src_physical_index = curr_children - 1 - (i - 1); // Old physical index
-            let dst_physical_index = new_children - 1 - i; // New physical index
-
-            let src_offset = constants::storage::PAGE_SIZE
-                - (src_physical_index + 1) * core::mem::size_of::<u64>();
-            let dst_offset = constants::storage::PAGE_SIZE
-                - (dst_physical_index + 1) * core::mem::size_of::<u64>();
-
-            let value = u64::from_le_bytes(
-                self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
-                    .try_into()
-                    .expect("Invalid offset"),
-            );
-            self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
-                .copy_from_slice(&value.to_le_bytes());
-        }
-
-        // Insert new child pointer at logical position insert_pos + 1
+        // NEW_CHILD goes at logical_pos = insert_pos + 1
         let new_child_physical_index = new_children - 1 - (insert_pos + 1);
+
+        for i in 0..=insert_pos {
+            let src_physical_index = (curr_children - 1) - i;
+            let dst_physical_index = (new_children - 1) - i; // This is src_physical_index + 1
+
+            if src_physical_index != dst_physical_index {
+                let src_offset = constants::storage::PAGE_SIZE
+                    - (src_physical_index + 1) * core::mem::size_of::<u64>();
+                let dst_offset = constants::storage::PAGE_SIZE
+                    - (dst_physical_index + 1) * core::mem::size_of::<u64>();
+
+                let value = u64::from_le_bytes(
+                    self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
+                        .try_into()
+                        .expect("Invalid offset"),
+                );
+                self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        // Insert new child pointer at logical position insert_pos + 1
         let child_ptr_offset = constants::storage::PAGE_SIZE
             - (new_child_physical_index + 1) * core::mem::size_of::<u64>();
         self.raw[child_ptr_offset..child_ptr_offset + core::mem::size_of::<u64>()]
@@ -451,12 +448,15 @@ impl<'a> BPlusInner<'a> {
             let new_children = curr_children - 1;
 
             // Shift child pointers left (remove pointer at logical position pos + 1)
-            for i in (pos + 1)..new_children {
-                let src_logical_index = i + 1; // Source logical index in old array
-                let dst_logical_index = i; // Destination logical index in new array
+            // Children at logical_pos [0, pos] must be "pushed" down
+            // to a lower physical index (higher memory address).
+            // We iterate forwards to "push" the data.
+            for i in 0..=pos {
+                let src_logical_index = i;
+                let dst_logical_index = i;
 
-                let src_physical_index = curr_children - 1 - src_logical_index;
-                let dst_physical_index = new_children - 1 - dst_logical_index;
+                let src_physical_index = (curr_children - 1) - src_logical_index;
+                let dst_physical_index = (new_children - 1) - dst_logical_index; // This is src_physical_index - 1
 
                 let src_offset = constants::storage::PAGE_SIZE
                     - (src_physical_index + 1) * core::mem::size_of::<u64>();
@@ -471,7 +471,6 @@ impl<'a> BPlusInner<'a> {
                 self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
                     .copy_from_slice(&value.to_le_bytes());
             }
-
             self.set_curr_vec_sz((curr_size - 1) as u32);
             self.set_free_space(self.free_space() + (key_size as u32 + 8));
             true
