@@ -18,7 +18,7 @@ impl<'a> base::DiskPage for BPlusLeaf<'a> {
 }
 
 impl<'a> BPlusLeaf<'a> {
-    // === Memory layout ===
+    // == Memory layout ==
     //   0..  1     -> Page Kind                        (u8)   -|
     //   1..  3     -> Level                            (u16)   |
     //   3..  4     -> Reserved                         (u8)    |
@@ -29,10 +29,58 @@ impl<'a> BPlusLeaf<'a> {
     //  32.. 36     -> Current Vector Size (num pairs) (u32)    |
     //  36.. 40     -> Key Size                        (u32)    |
     //  40.. 64     -> Reserved                                -|
-    //  64.. N      -> Keys growing forward: key0, key1, ... (each key_size bytes)
-    //  M.. PAGE_SIZE -> Values growing backward: value0 @ PAGE_SIZE-8, value1 @ PAGE_SIZE-16, etc. (each u64)
-    //  Free space between N and M.
-    //  Physical order of values in memory: value(n-1), ..., value0 (reversed logical order)
+    //  64.. N      -> Entry 0 (Key | Value)
+    //  N.. M      -> Entry 1 (Key | Value)
+    //  ...
+    //  Y.. Z      -> Entry N-1 (Key | Value)
+    //  Z.. PAGE_SIZE -> Free Space
+    //
+    // Each Entry is (key_size + 8) bytes.
+
+    const DATA_START: usize = 64;
+
+    /// Returns the size of one key + value entry.
+    fn entry_size(&self) -> usize {
+        self.get_key_size() as usize + std::mem::size_of::<u64>()
+    }
+
+    /// Returns a slice to the key at the given logical index.
+    fn get_key_at(&self, index: usize) -> &[u8] {
+        let key_size = self.get_key_size() as usize;
+        let entry_size = self.entry_size();
+        let offset = Self::DATA_START + index * entry_size;
+        &self.raw[offset..offset + key_size]
+    }
+
+    /// Returns the value (u64) at the given logical index.
+    fn get_value_at(&self, index: usize) -> u64 {
+        let key_size = self.get_key_size() as usize;
+        let entry_size = self.entry_size();
+        let offset = Self::DATA_START + index * entry_size + key_size;
+        let bytes = self.raw[offset..offset + 8]
+            .try_into()
+            .expect("Invalid value slice");
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Writes a key-value entry to the given logical index.
+    /// Assumes space has already been allocated (e.g., by shifting).
+    fn set_entry(&mut self, index: usize, key: &[u8], value: u64) {
+        let key_size = self.get_key_size() as usize;
+        let entry_size = self.entry_size();
+        let offset = Self::DATA_START + index * entry_size;
+
+        self.raw[offset..offset + key_size].copy_from_slice(key);
+        self.raw[offset + key_size..offset + entry_size].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Sets the value for an *existing* key at the given logical index.
+    fn set_value_at(&mut self, index: usize, value: u64) {
+        let key_size = self.get_key_size() as usize;
+        let entry_size = self.entry_size();
+        let offset = Self::DATA_START + index * entry_size + key_size;
+        self.raw[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
 
     pub fn new(raw: &'a mut base::PageBuf) -> Self {
         if raw.len() != constants::storage::PAGE_SIZE {
@@ -47,25 +95,22 @@ impl<'a> BPlusLeaf<'a> {
     pub fn init(&mut self, page_id: base::PageId) {
         self.set_page_kind(base::PageKind::BPlusLeaf);
         self.set_level(0);
-        self.set_free_space((constants::storage::PAGE_SIZE - 64) as u32);
+        self.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
         self.set_page_id(page_id);
         self.set_prev_sibling(None);
         self.set_next_sibling(None);
         self.set_curr_vec_sz(0);
         self.set_key_size(0);
         self.raw[3] = 0; // Reserved byte
-        self.raw[40..64].fill(0); // Reserved section
+        self.raw[40..Self::DATA_START].fill(0); // Reserved section
     }
 
-    // Metadata getters
     pub const fn page_kind(&self) -> u8 {
         self.raw[0]
     }
-
     pub fn page_level(&self) -> u16 {
         u16::from_le_bytes(self.raw[1..3].try_into().expect("Invalid page offset"))
     }
-
     pub fn free_space(&self) -> u32 {
         u32::from_le_bytes(
             self.raw[4..8]
@@ -73,12 +118,10 @@ impl<'a> BPlusLeaf<'a> {
                 .expect("Invalid free_space offset"),
         )
     }
-
     pub fn page_id(&self) -> base::PageId {
         let val = u64::from_le_bytes(self.raw[8..16].try_into().expect("Invalid page_id offset"));
         base::PageId::new(val).expect("Invalid page ID")
     }
-
     pub fn prev_sibling(&self) -> Option<base::PageId> {
         let val = u64::from_le_bytes(
             self.raw[16..24]
@@ -87,7 +130,6 @@ impl<'a> BPlusLeaf<'a> {
         );
         base::PageId::new(val)
     }
-
     pub fn next_sibling(&self) -> Option<base::PageId> {
         let val = u64::from_le_bytes(
             self.raw[24..32]
@@ -96,7 +138,6 @@ impl<'a> BPlusLeaf<'a> {
         );
         base::PageId::new(val)
     }
-
     pub fn curr_vec_sz(&self) -> u32 {
         u32::from_le_bytes(
             self.raw[32..36]
@@ -104,7 +145,6 @@ impl<'a> BPlusLeaf<'a> {
                 .expect("Invalid curr_vec_sz offset"),
         )
     }
-
     pub fn get_key_size(&self) -> u32 {
         u32::from_le_bytes(
             self.raw[36..40]
@@ -112,23 +152,18 @@ impl<'a> BPlusLeaf<'a> {
                 .expect("Invalid key_size offset"),
         )
     }
-
     pub fn set_page_kind(&mut self, kind: base::PageKind) {
         self.raw[0] = kind as u8;
     }
-
     pub fn set_free_space(&mut self, free: u32) {
         self.raw[4..8].copy_from_slice(&free.to_le_bytes());
     }
-
     pub fn set_page_id(&mut self, id: base::PageId) {
         self.raw[8..16].copy_from_slice(&id.get().to_le_bytes());
     }
-
     pub fn set_level(&mut self, level: u16) {
         self.raw[1..3].copy_from_slice(&level.to_le_bytes());
     }
-
     pub fn set_prev_sibling(&mut self, id: Option<base::PageId>) {
         let bytes = match id {
             Some(page_id) => page_id.get().to_le_bytes(),
@@ -136,7 +171,6 @@ impl<'a> BPlusLeaf<'a> {
         };
         self.raw[16..24].copy_from_slice(&bytes);
     }
-
     pub fn set_next_sibling(&mut self, id: Option<base::PageId>) {
         let bytes = match id {
             Some(page_id) => page_id.get().to_le_bytes(),
@@ -144,52 +178,11 @@ impl<'a> BPlusLeaf<'a> {
         };
         self.raw[24..32].copy_from_slice(&bytes);
     }
-
     pub fn set_curr_vec_sz(&mut self, size: u32) {
         self.raw[32..36].copy_from_slice(&size.to_le_bytes());
     }
-
     pub fn set_key_size(&mut self, key_size: u32) {
         self.raw[36..40].copy_from_slice(&key_size.to_le_bytes());
-    }
-
-    pub fn get_keys(&self) -> &[u8] {
-        let size = self.curr_vec_sz() as usize;
-        let key_size = self.get_key_size() as usize;
-        let start = 64;
-        let end = start + size * key_size;
-        if end > constants::storage::PAGE_SIZE {
-            panic!("Invalid keys vector size");
-        }
-        &self.raw[start..end]
-    }
-
-    pub fn get_value_ptrs(&self) -> Vec<u64> {
-        let size = self.curr_vec_sz() as usize;
-        if size == 0 {
-            return vec![];
-        }
-
-        // Values are stored in reverse order physically:
-        // raw[PAGE_SIZE - 8 .. PAGE_SIZE] => value(n-1)
-        // raw[PAGE_SIZE - 16 .. PAGE_SIZE - 8] => value(n-2)
-        // We want logical order: value(0), value(1), ..., value(n-1)
-        let start = constants::storage::PAGE_SIZE - size * core::mem::size_of::<u64>();
-        let end = constants::storage::PAGE_SIZE;
-        if start >= end {
-            panic!("Invalid value pointers vector size");
-        }
-
-        let mut out = Vec::with_capacity(size);
-        self.raw[start..end]
-            .chunks_exact(core::mem::size_of::<u64>())
-            .rev()
-            .for_each(|chunk| {
-                let arr: [u8; 8] = chunk.try_into().expect("Invalid chunk size");
-                out.push(u64::from_le_bytes(arr));
-            });
-
-        out
     }
 
     pub fn get_value(&self, key: &[u8]) -> Option<u64> {
@@ -198,50 +191,13 @@ impl<'a> BPlusLeaf<'a> {
             return None;
         }
 
-        let num_pairs = self.curr_vec_sz() as usize;
-        if num_pairs == 0 {
-            return None;
-        }
-
-        let keys = self.get_keys();
-
-        let mut left = 0usize;
-        let mut right = num_pairs;
-
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let key_start = mid * key_size;
-            let stored_key = &keys[key_start..key_start + key_size];
-
-            match stored_key.cmp(key) {
-                core::cmp::Ordering::Equal => {
-                    let physical_value_index = num_pairs - 1 - mid;
-                    let value_offset = constants::storage::PAGE_SIZE
-                        - (physical_value_index + 1) * core::mem::size_of::<u64>();
-
-                    let end = value_offset + core::mem::size_of::<u64>();
-                    if end > constants::storage::PAGE_SIZE {
-                        return None;
-                    }
-
-                    let bytes: [u8; 8] = self.raw[value_offset..end]
-                        .try_into()
-                        .expect("Invalid value bytes length");
-
-                    return Some(u64::from_le_bytes(bytes));
-                }
-                core::cmp::Ordering::Less => left = mid + 1,
-                core::cmp::Ordering::Greater => right = mid,
-            }
-        }
-
-        None
+        self.find_key_position(key)
+            .map(|pos| self.get_value_at(pos))
     }
 
     /// Check if there's space for one more key-value pair
     pub fn has_space_for_key(&self) -> bool {
-        let required_space = self.get_key_size() + 8; // key + value
-        self.free_space() >= required_space
+        self.free_space() >= (self.entry_size() as u32)
     }
 
     pub fn insert_sorted(&mut self, key: &[u8], value: u64) {
@@ -250,76 +206,34 @@ impl<'a> BPlusLeaf<'a> {
 
         if let Some(pos) = self.find_key_position(key) {
             // Key already exists. Update its value.
-            // Physical storage of values is reversed
-            let physical_value_index = curr_size - 1 - pos;
-            let value_offset = constants::storage::PAGE_SIZE
-                - (physical_value_index + 1) * core::mem::size_of::<u64>();
-            let end = value_offset + core::mem::size_of::<u64>();
-
-            self.raw[value_offset..end].copy_from_slice(&value.to_le_bytes());
-            // No size or free space change, so we can return early.
+            self.set_value_at(pos, value);
             return;
         }
 
-        // Find insertion position (since key doesn't exist)
+        // Key does not exist. Insert new entry.
         let insert_pos = self.find_insert_position(key);
+        let entry_size = self.entry_size();
 
-        // Shift existing keys right to make room
+        // Shift existing entries right to make room
         if insert_pos < curr_size {
-            let keys_start = 64;
-            let src_start = keys_start + insert_pos * key_size;
-            let dst_start = src_start + key_size;
-            let move_len = (curr_size - insert_pos) * key_size;
+            let offset = Self::DATA_START + insert_pos * entry_size;
+            let move_len = (curr_size - insert_pos) * entry_size;
             self.raw
-                .copy_within(src_start..src_start + move_len, dst_start);
-        }
-
-        // Shift existing values right to make room
-        if insert_pos < curr_size {
-            for i in (insert_pos..curr_size).rev() {
-                let src_physical_index = curr_size - 1 - i;
-                let dst_physical_index = curr_size - i; // One position further from end
-
-                let src_offset = constants::storage::PAGE_SIZE
-                    - (src_physical_index + 1) * core::mem::size_of::<u64>();
-                let dst_offset = constants::storage::PAGE_SIZE
-                    - (dst_physical_index + 1) * core::mem::size_of::<u64>();
-
-                let val = u64::from_le_bytes(
-                    self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
-                        .try_into()
-                        .expect("Invalid offset"),
-                );
-                self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
-                    .copy_from_slice(&val.to_le_bytes());
-            }
+                .copy_within(offset..offset + move_len, offset + entry_size);
         }
 
         // Insert the new key-value pair
-        let keys_start = 64;
-        let key_pos = keys_start + insert_pos * key_size;
-
-        // Calculate physical position for the new value
-        let new_physical_index = (curr_size + 1) - 1 - insert_pos;
-        let value_pos =
-            constants::storage::PAGE_SIZE - (new_physical_index + 1) * core::mem::size_of::<u64>();
-
-        self.raw[key_pos..key_pos + key_size].copy_from_slice(key);
-        self.raw[value_pos..value_pos + core::mem::size_of::<u64>()]
-            .copy_from_slice(&value.to_le_bytes());
+        self.set_entry(insert_pos, key, value);
 
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
-
         let free_space = self.free_space();
-        self.set_free_space(free_space - (key_size as u32 + 8));
+        self.set_free_space(free_space - (entry_size as u32));
     }
 
     /// Find the correct position to insert a key (maintaining sorted order)
     fn find_insert_position(&self, key: &[u8]) -> usize {
-        let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
-        let keys = self.get_keys();
 
         // Use binary search for better performance
         let mut left = 0;
@@ -327,10 +241,9 @@ impl<'a> BPlusLeaf<'a> {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let key_start = mid * key_size;
-            let stored_key = &keys[key_start..key_start + key_size];
+            let stored_key = self.get_key_at(mid);
 
-            if stored_key <= key {
+            if stored_key < key {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -340,53 +253,26 @@ impl<'a> BPlusLeaf<'a> {
         left
     }
 
-    /// Remove a key and return true if found
     pub fn remove_key(&mut self, key: &[u8]) -> bool {
         let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
 
         // Find the key
         if let Some(pos) = self.find_key_position(key) {
-            // Shift keys left to fill the gap
+            let entry_size = self.entry_size();
+
+            // Shift entries left to fill the gap
             if pos < curr_size - 1 {
-                let keys_start = 64;
-                let src_start = keys_start + (pos + 1) * key_size;
-                let dst_start = keys_start + pos * key_size;
-                let move_len = (curr_size - pos - 1) * key_size;
+                let offset = Self::DATA_START + pos * entry_size;
+                let move_len = (curr_size - pos - 1) * entry_size;
                 self.raw
-                    .copy_within(src_start..src_start + move_len, dst_start);
-            }
-
-            // Shift values left to fill the gap
-            // We need to remove the value at logical position pos
-            if pos < curr_size - 1 {
-                for i in pos..(curr_size - 1) {
-                    let src_logical_index = i + 1;
-                    let dst_logical_index = i;
-
-                    let src_physical_index = curr_size - 1 - src_logical_index;
-                    let dst_physical_index = (curr_size - 1) - 1 - dst_logical_index;
-
-                    let src_offset = constants::storage::PAGE_SIZE
-                        - (src_physical_index + 1) * core::mem::size_of::<u64>();
-                    let dst_offset = constants::storage::PAGE_SIZE
-                        - (dst_physical_index + 1) * core::mem::size_of::<u64>();
-
-                    let val = u64::from_le_bytes(
-                        self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
-                            .try_into()
-                            .expect("Invalid offset"),
-                    );
-                    self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
-                        .copy_from_slice(&val.to_le_bytes());
-                }
+                    .copy_within(offset + entry_size..offset + entry_size + move_len, offset);
             }
 
             // Update metadata
             self.set_curr_vec_sz((curr_size - 1) as u32);
-
             let free_space = self.free_space();
-            self.set_free_space(free_space + (key_size as u32 + 8));
+            self.set_free_space(free_space + (entry_size as u32));
             true
         } else {
             false
@@ -395,9 +281,7 @@ impl<'a> BPlusLeaf<'a> {
 
     /// Find the position of a key, return None if not found
     fn find_key_position(&self, key: &[u8]) -> Option<usize> {
-        let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
-        let keys = self.get_keys();
 
         // Use binary search
         let mut left = 0;
@@ -405,8 +289,7 @@ impl<'a> BPlusLeaf<'a> {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let key_start = mid * key_size;
-            let stored_key = &keys[key_start..key_start + key_size];
+            let stored_key = self.get_key_at(mid);
 
             match stored_key.cmp(key) {
                 core::cmp::Ordering::Equal => return Some(mid),
@@ -434,12 +317,14 @@ impl<'a> BPlusLeaf<'a> {
 
     /// Calculate maximum number of keys this leaf can hold
     pub fn calculate_max_keys(&self) -> u32 {
-        let available_space = constants::storage::PAGE_SIZE - 64; // Subtract header size
-        let space_per_entry = self.get_key_size() + 8; // key + value
-        (available_space / space_per_entry as usize) as u32
+        if self.get_key_size() == 0 {
+            // Avoid division by zero if key size not set
+            return 0;
+        }
+        let available_space = constants::storage::PAGE_SIZE - Self::DATA_START;
+        (available_space / self.entry_size()) as u32
     }
 
-    /// Split this leaf with a new key, distributing entries between old and new leaf
     pub fn split_and_get_new_entries(
         &mut self,
         key: &[u8],
@@ -452,52 +337,55 @@ impl<'a> BPlusLeaf<'a> {
 
         let curr_size = self.curr_vec_sz() as usize;
 
-        // Build vector of all entries (logical order)
+        // Build vector of all entries INCLUDING THE NEW ONE
         let mut all_entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(curr_size + 1);
-        {
-            let keys_buf = self.get_keys();
-            let values_vec = self.get_value_ptrs();
-            for i in 0..curr_size {
-                let ks = i * key_size;
-                all_entries.push((keys_buf[ks..ks + key_size].to_vec(), values_vec[i]));
-            }
+        for i in 0..curr_size {
+            all_entries.push((self.get_key_at(i).to_vec(), self.get_value_at(i)));
         }
 
-        // Try to find existing key -> if found, update value (no duplicate)
-        if let Some(idx) = all_entries.iter().position(|(k, _)| k.as_slice() == key) {
-            all_entries[idx].1 = value;
+        // Find where new key should go
+        let insert_pos = all_entries
+            .iter()
+            .position(|(k, _)| k.as_slice() >= key)
+            .unwrap_or(all_entries.len());
+
+        // Check if key already exists
+        if insert_pos < all_entries.len() && all_entries[insert_pos].0.as_slice() == key {
+            // Update existing key's value
+            all_entries[insert_pos].1 = value;
         } else {
-            // find insertion position (first key > new key)
-            let insert_pos = all_entries
-                .iter()
-                .position(|(k, _)| k.as_slice() > key)
-                .unwrap_or(all_entries.len());
+            // Insert new key
             all_entries.insert(insert_pos, (key.to_vec(), value));
         }
 
-        // Determine split point (even split; right side may have equal or +1 entries)
         let total_entries = all_entries.len();
         if total_entries == 0 {
             return Err("split_and_get_new_entries: no entries to split");
         }
-        let split_point = total_entries / 2; // entries [0..split_point) -> left, [split_point..end) -> right
 
-        // Rebuild left (this) leaf with first half
-        self.set_curr_vec_sz(0);
-        self.set_free_space((constants::storage::PAGE_SIZE - 64) as u32);
+        let split_point = total_entries / 2;
+
+        // --- Rebuild this (left) page ---
+        // Clear the data area
+        self.raw[Self::DATA_START..].fill(0);
+
+        // Write the first half of entries
         for i in 0..split_point {
             let (ref k, v) = all_entries[i];
-            self.insert_sorted(k, v);
+            self.set_entry(i, k, v);
         }
 
-        // Create vector for the new (right) leaf
-        let mut new_page_entries: Vec<(Vec<u8>, u64)> =
-            Vec::with_capacity(total_entries - split_point);
-        for i in split_point..total_entries {
-            new_page_entries.push(all_entries[i].clone());
-        }
+        // Update metadata for this page
+        self.set_curr_vec_sz(split_point as u32);
+        let used_space = split_point * self.entry_size();
+        self.set_free_space(
+            (constants::storage::PAGE_SIZE as u32 - Self::DATA_START as u32)
+                .saturating_sub(used_space as u32),
+        );
 
-        // split_key is the first key of the new (right) leaf
+        // Create vector for the new (right) page - entries [split_point..total_entries)
+        let new_page_entries: Vec<(Vec<u8>, u64)> = all_entries[split_point..].to_vec();
+
         let split_key = all_entries[split_point].0.clone();
 
         Ok((SplitResult { split_key }, new_page_entries))
@@ -508,10 +396,7 @@ impl<'a> BPlusLeaf<'a> {
         if self.curr_vec_sz() == 0 {
             return None;
         }
-
-        let key_size = self.get_key_size() as usize;
-        let keys = self.get_keys();
-        Some(keys[0..key_size].to_vec())
+        Some(self.get_key_at(0).to_vec())
     }
 
     /// Get the last key in this leaf
@@ -520,11 +405,7 @@ impl<'a> BPlusLeaf<'a> {
         if curr_size == 0 {
             return None;
         }
-
-        let key_size = self.get_key_size() as usize;
-        let keys = self.get_keys();
-        let last_key_start = (curr_size - 1) * key_size;
-        Some(keys[last_key_start..last_key_start + key_size].to_vec())
+        Some(self.get_key_at(curr_size - 1).to_vec())
     }
 
     /// Move the last key-value pair to another leaf
@@ -534,24 +415,17 @@ impl<'a> BPlusLeaf<'a> {
             return None;
         }
 
-        let key_size = self.get_key_size() as usize;
-        let keys = self.get_keys();
-        let values = self.get_value_ptrs();
+        let last_key = self.get_key_at(curr_size - 1).to_vec();
+        let last_value = self.get_value_at(curr_size - 1);
 
-        let last_key_start = (curr_size - 1) * key_size;
-        let last_key = &keys[last_key_start..last_key_start + key_size];
-        let last_value = values[curr_size - 1];
+        // Remove from this leaf *first*
+        self.remove_key(&last_key);
 
         // Insert into target at the beginning
-        target.insert_at_beginning(last_key, last_value);
-        let moved_key = Some(last_key.to_vec());
+        target.insert_at_beginning(&last_key, last_value);
 
-        // Remove from this leaf
-        self.set_curr_vec_sz((curr_size - 1) as u32);
-
-        let free_space = self.free_space();
-        self.set_free_space(free_space + (key_size as u32 + 8));
-        moved_key
+        // The key to update in the parent is the *new* first key of the target
+        Some(target.get_key_at(0).to_vec())
     }
 
     /// Move the first key-value pair to another leaf
@@ -561,112 +435,44 @@ impl<'a> BPlusLeaf<'a> {
             return None;
         }
 
-        let key_size = self.get_key_size() as usize;
-        let keys = self.get_keys();
-        let values = self.get_value_ptrs();
+        let first_key = self.get_key_at(0).to_vec();
+        let first_value = self.get_value_at(0);
 
-        let first_key = &keys[0..key_size];
-        let first_value = values[0];
+        // Insert into target at the end (insert_sorted handles this)
+        target.insert_sorted(&first_key, first_value);
 
-        // Insert into target at the end
-        target.insert_sorted(first_key, first_value);
+        // Remove from this leaf
+        self.remove_key(&first_key);
 
-        // Get the new first key (if any) before removing
-        let new_first_key = if curr_size > 1 {
-            Some(keys[key_size..key_size * 2].to_vec())
+        // Return the new first key of this leaf (if any)
+        if self.curr_vec_sz() > 0 {
+            Some(self.get_key_at(0).to_vec())
         } else {
             None
-        };
-
-        // Remove from this leaf by shifting everything left
-        if curr_size > 1 {
-            // Shift keys left
-            let keys_start = 64;
-            let src_start = keys_start + key_size;
-            let dst_start = keys_start;
-            let move_len = (curr_size - 1) * key_size;
-            self.raw
-                .copy_within(src_start..src_start + move_len, dst_start);
-
-            // Shift values left
-            for i in 0..(curr_size - 1) {
-                let src_logical_index = i + 1;
-                let dst_logical_index = i;
-
-                let src_physical_index = curr_size - 1 - src_logical_index;
-                let dst_physical_index = (curr_size - 1) - 1 - dst_logical_index;
-
-                let src_offset = constants::storage::PAGE_SIZE
-                    - (src_physical_index + 1) * core::mem::size_of::<u64>();
-                let dst_offset = constants::storage::PAGE_SIZE
-                    - (dst_physical_index + 1) * core::mem::size_of::<u64>();
-
-                let val = u64::from_le_bytes(
-                    self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
-                        .try_into()
-                        .expect("Invalid offset"),
-                );
-                self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
-                    .copy_from_slice(&val.to_le_bytes());
-            }
         }
-
-        self.set_curr_vec_sz((curr_size - 1) as u32);
-        let free_space = self.free_space();
-        self.set_free_space(free_space + (key_size as u32 + 8));
-        new_first_key
     }
 
     /// Insert a key-value pair at the beginning of the leaf
     fn insert_at_beginning(&mut self, key: &[u8], value: u64) {
         let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
+        let entry_size = self.entry_size();
 
-        // Shift keys right
+        // Shift all entries right by one
         if curr_size > 0 {
-            let keys_start = 64;
-            let src_start = keys_start;
-            let dst_start = keys_start + key_size;
-            let move_len = curr_size * key_size;
+            let offset = Self::DATA_START;
+            let move_len = curr_size * entry_size;
             self.raw
-                .copy_within(src_start..src_start + move_len, dst_start);
-        }
-
-        // Shift values right
-        if curr_size > 0 {
-            for i in (0..curr_size).rev() {
-                let src_physical_index = curr_size - 1 - i;
-                let dst_physical_index = (curr_size + 1) - 1 - (i + 1);
-
-                let src_offset = constants::storage::PAGE_SIZE
-                    - (src_physical_index + 1) * core::mem::size_of::<u64>();
-                let dst_offset = constants::storage::PAGE_SIZE
-                    - (dst_physical_index + 1) * core::mem::size_of::<u64>();
-
-                let val = u64::from_le_bytes(
-                    self.raw[src_offset..src_offset + core::mem::size_of::<u64>()]
-                        .try_into()
-                        .expect("Invalid offset"),
-                );
-                self.raw[dst_offset..dst_offset + core::mem::size_of::<u64>()]
-                    .copy_from_slice(&val.to_le_bytes());
-            }
+                .copy_within(offset..offset + move_len, offset + entry_size);
         }
 
         // Insert at position 0
-        let keys_start = 64;
-        let new_physical_index = (curr_size + 1) - 1 - 0;
-        let value_pos =
-            constants::storage::PAGE_SIZE - (new_physical_index + 1) * core::mem::size_of::<u64>();
-
-        self.raw[keys_start..keys_start + key_size].copy_from_slice(key);
-        self.raw[value_pos..value_pos + core::mem::size_of::<u64>()]
-            .copy_from_slice(&value.to_le_bytes());
+        self.set_entry(0, key, value);
 
         // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
         let free_space = self.free_space();
-        self.set_free_space(free_space - (key_size as u32 + 8));
+        self.set_free_space(free_space - (entry_size as u32));
     }
 
     /// Merge all entries from another leaf into this one
@@ -676,20 +482,13 @@ impl<'a> BPlusLeaf<'a> {
             return;
         }
 
-        let key_size = self.get_key_size() as usize;
-        let other_keys = other.get_keys();
-        let other_values = other.get_value_ptrs();
-
-        // Add all entries from other leaf
         for i in 0..other_size {
-            let key_start = i * key_size;
-            let key = &other_keys[key_start..key_start + key_size];
-            let value = other_values[i];
+            let key = other.get_key_at(i);
+            let value = other.get_value_at(i);
             self.insert_sorted(key, value);
         }
 
-        // Clear other leaf
         other.set_curr_vec_sz(0);
-        other.set_free_space(constants::storage::PAGE_SIZE as u32 - 64);
+        other.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
     }
 }

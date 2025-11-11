@@ -3,6 +3,7 @@ use crate::storage::buffer::Evictor;
 use crate::storage::disk;
 use crate::storage::page;
 use crate::storage::page_locator::{PageLocator, locator};
+use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::pin::Pin;
 
@@ -82,7 +83,8 @@ struct FrameMeta {
 
 pub struct BufferPoolCore {
     // All original fields except page_locator
-    frames_backing_buf: Box<[u8; FRAME_COUNT * constants::storage::PAGE_SIZE]>,
+    frames_backing_buf: *mut u8,
+    layout: Layout,
     frames: [Option<Frame>; FRAME_COUNT],
     free_frames: u32,
 
@@ -93,6 +95,14 @@ pub struct BufferPoolCore {
     evictor: Box<dyn Evictor>,
 
     _pin: std::marker::PhantomPinned,
+}
+
+impl Drop for BufferPoolCore {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.frames_backing_buf, self.layout);
+        }
+    }
 }
 
 impl BufferPoolCore {
@@ -443,7 +453,6 @@ impl BufferPoolCore {
         unsafe {
             self.get_unchecked_mut()
                 .frames_backing_buf
-                .as_mut_ptr()
                 .add(offset)
                 .cast::<page::base::PageBuf>()
         }
@@ -461,9 +470,24 @@ impl BufferPool {
         evictor: Box<dyn Evictor>,
         page_locator: Box<dyn PageLocator>,
     ) -> Self {
+        let size = FRAME_COUNT * constants::storage::PAGE_SIZE;
+        let align = constants::storage::PAGE_SIZE;
+        let layout = Layout::from_size_align(size, align)
+            .expect("Failed to create memory layout for buffer pool");
+
+        let backing_buf_ptr = unsafe {
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                panic!("Failed to allocate aligned memory for buffer pool");
+            }
+            std::ptr::write_bytes(ptr, 0, size);
+            ptr
+        };
+
         Self {
             core: BufferPoolCore {
-                frames_backing_buf: Box::new([0u8; FRAME_COUNT * constants::storage::PAGE_SIZE]),
+                frames_backing_buf: backing_buf_ptr,
+                layout: layout,
                 frames: std::array::from_fn(|_| None),
                 free_frames: FRAME_COUNT as u32,
                 frames_meta_pid: HashMap::new(),
@@ -475,7 +499,6 @@ impl BufferPool {
             page_locator,
         }
     }
-
     pub fn core(self: Pin<&mut Self>) -> Pin<&mut BufferPoolCore> {
         unsafe { self.map_unchecked_mut(|s| &mut s.core) }
     }
@@ -552,7 +575,6 @@ impl BufferPool {
     pub fn mark_frame_dirty(self: Pin<&mut Self>, frame_id: u32) {
         self.core().mark_frame_dirty(frame_id)
     }
-
     pub fn register_page_in_directory(
         mut self: Pin<&mut Self>,
         page_id: page::base::PageId,
@@ -579,7 +601,6 @@ impl BufferPool {
         use crate::storage::page_locator::locator::errors::RegisterPageError;
         use std::sync::atomic::Ordering;
 
-        // Try to register first
         let (core, locator) = unsafe {
             let this = self.as_mut().get_unchecked_mut();
             (Pin::new_unchecked(&mut this.core), &mut this.page_locator)
@@ -887,19 +908,27 @@ mod buffer_tests {
 
         let page_id_on_disk = PageId::new(100).unwrap();
         let offset_on_disk: u64 = 0;
-        let mut page_buf_disk = [0u8; constants::storage::PAGE_SIZE];
+        let layout =
+            Layout::from_size_align(constants::storage::PAGE_SIZE, constants::storage::PAGE_SIZE)
+                .expect("Failed to create layout");
+        let page_buf_disk_ptr = unsafe { alloc(layout) };
+        if page_buf_disk_ptr.is_null() {
+            panic!("Failed to allocate aligned memory for test");
+        }
+        let page_buf_disk =
+            unsafe { &mut *(page_buf_disk_ptr as *mut [u8; constants::storage::PAGE_SIZE]) };
 
         {
             let mut fm_direct = FileManager::new(temp_path.to_str().unwrap().to_string()).unwrap();
 
             // Initialize buffer for SlottedData page
-            page::base::init_page_buf(&mut page_buf_disk, PageKind::SlottedData);
+            page::base::init_page_buf(page_buf_disk, PageKind::SlottedData);
             // Need to set PageId manually in the buffer
             page_buf_disk[8..16].copy_from_slice(&page_id_on_disk.get().to_le_bytes());
 
             // Write this buffer directly to the file
             fm_direct
-                .write_block_from(offset_on_disk, &page_buf_disk)
+                .write_block_from(offset_on_disk, &page_buf_disk[..])
                 .expect("Failed to write initial page directly to disk");
         } // fm_direct goes out of scope, file is closed
 

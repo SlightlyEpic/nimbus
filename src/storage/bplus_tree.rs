@@ -23,6 +23,16 @@ enum SplitData {
     Split { key: Vec<u8>, right_page_id: PageId },
 }
 
+#[derive(Debug)]
+enum DeleteResult {
+    /// The key was not found.
+    NotFound,
+    /// The key was found and deleted.
+    Deleted,
+    /// The key was found and deleted, and it was the first key in its leaf.
+    /// The parent's separator key must be updated.
+    DeletedAndPromote(Vec<u8>),
+}
 // B+ tree struct
 // access to api find and insert
 // I/P: Pin<& mut Bufferpool>
@@ -83,8 +93,6 @@ impl BplusTree {
             .map_err(|_| BTreeError::PageNotFound)
     }
 
-    /// Finds a value associated with a key.
-    /// Manages pinning and unpinning of pages during traversal.
     pub fn find(
         &self,
         key: &[u8],
@@ -165,8 +173,9 @@ impl BplusTree {
 
             new_root_page.init(new_root_id, old_root_level + 1);
             new_root_page.set_key_size(self.key_size);
-            new_root_page.insert_sorted(&new_key, new_child_page_id);
+
             new_root_page.set_child_at(0, old_root_id);
+            new_root_page.insert_sorted(&new_key, new_child_page_id);
 
             bpm.as_mut().mark_frame_dirty(new_root_frame_id);
             bpm.as_mut().unpin_frame(new_root_frame_id)?;
@@ -179,7 +188,15 @@ impl BplusTree {
         Ok(())
     }
 
-    /// Recursive helper for insertion
+    pub fn delete(
+        &mut self,
+        key: &[u8],
+        mut bpm: Pin<&mut BufferPool>,
+    ) -> Result<bool, BTreeError> {
+        self.delete_internal(self.root_page_id, key, bpm.as_mut())
+            .map(|_| true)
+    }
+
     fn insert_internal(
         &mut self,
         current_page_id: PageId,
@@ -188,7 +205,6 @@ impl BplusTree {
         mut bpm: Pin<&mut BufferPool>,
         page_id_counter: &AtomicU64,
     ) -> Result<SplitData, BTreeError> {
-        // 1. Fetch page and check its type
         let (page_kind, is_full, level) = {
             let frame = bpm.as_mut().fetch_page(current_page_id)?;
             let frame_id = frame.fid();
@@ -212,12 +228,9 @@ impl BplusTree {
             (page_kind, is_full, level)
         };
 
-        // 2. Handle insertion or split based on page type
         match page_kind {
-            //  BASE CASE: We are at a Leaf Page
             PageKind::BPlusLeaf => {
                 if !is_full {
-                    // Simple case: insert into leaf
                     let frame = bpm.as_mut().fetch_page(current_page_id)?;
                     let frame_id = frame.fid();
                     let mut page_view = frame.page_view();
@@ -232,8 +245,6 @@ impl BplusTree {
                     return Ok(SplitData::NoSplit);
                 }
 
-                // Hard case: Leaf page is full, must split
-                // 1. Fetch old page, call split, get new entries, and unpin
                 let (split_key, new_page_entries, old_next_sibling_id) = {
                     let frame = bpm.as_mut().fetch_page(current_page_id)?;
                     let frame_id = frame.fid();
@@ -257,23 +268,25 @@ impl BplusTree {
                         new_page_entries,
                         old_next_sibling_id,
                     )
-                }; // --- old_frame borrow ends ---
+                };
 
-                // 2. Allocate new page, fill it, and unpin
                 let new_page_id =
                     PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1).unwrap();
-                {
+
+                let new_page_offset = {
                     let new_frame = bpm
                         .as_mut()
                         .alloc_new_page(PageKind::BPlusLeaf, new_page_id)?;
                     let new_frame_id = new_frame.fid();
+                    let new_offset = new_frame.file_offset();
+
                     let mut new_page_view = new_frame.page_view();
                     let new_leaf = match &mut new_page_view {
                         Page::BPlusLeaf(leaf) => leaf,
                         _ => return Err(BTreeError::InvalidPageType),
                     };
 
-                    new_leaf.init(new_page_id); // init sets level 0
+                    new_leaf.init(new_page_id);
                     new_leaf.set_key_size(self.key_size);
 
                     for (k, v) in new_page_entries {
@@ -285,9 +298,12 @@ impl BplusTree {
 
                     bpm.as_mut().mark_frame_dirty(new_frame_id);
                     bpm.as_mut().unpin_frame(new_frame_id)?;
-                } // --- new_frame borrow ends ---
 
-                // 3. Re-fetch old page to update its next_sibling pointer
+                    new_offset
+                };
+
+                self.register_page(new_page_id, new_page_offset, bpm.as_mut(), page_id_counter)?;
+
                 {
                     let old_frame = bpm.as_mut().fetch_page(current_page_id)?;
                     let old_frame_id = old_frame.fid();
@@ -300,9 +316,8 @@ impl BplusTree {
                         _ => return Err(BTreeError::InvalidPageType),
                     }
                     bpm.as_mut().unpin_frame(old_frame_id)?;
-                } // --- old_frame borrow ends ---
+                }
 
-                // 4. Update the *next* sibling's prev pointer if it exists
                 if let Some(next_id) = old_next_sibling_id {
                     let next_frame = bpm.as_mut().fetch_page(next_id)?;
                     let next_frame_id = next_frame.fid();
@@ -315,18 +330,15 @@ impl BplusTree {
                         _ => return Err(BTreeError::InvalidPageType),
                     }
                     bpm.as_mut().unpin_frame(next_frame_id)?;
-                } // --- next_frame borrow ends ---
+                }
 
-                // 7. Return split info to parent
                 Ok(SplitData::Split {
                     key: split_key,
                     right_page_id: new_page_id,
                 })
             }
 
-            //  RECURSIVE CASE: We are at an Inner Page
             PageKind::BPlusInner => {
-                // 1. Find the correct child to descend into
                 let child_page_id = {
                     let frame = bpm.as_mut().fetch_page(current_page_id)?;
                     let frame_id = frame.fid();
@@ -342,22 +354,16 @@ impl BplusTree {
                     child_id
                 };
 
-                // 2. Recursively call insert on that child
                 let split_result =
                     self.insert_internal(child_page_id, key, value, bpm.as_mut(), page_id_counter)?;
 
-                // 3. Handle the result from the child
                 match split_result {
-                    // Child did not split, we are done
                     SplitData::NoSplit => Ok(SplitData::NoSplit),
-
-                    // Child *did* split, we must insert its new key and pointer
                     SplitData::Split {
                         key: new_key,
                         right_page_id: new_child_page_id,
                     } => {
                         if !is_full {
-                            // Simple case: insert new key and child pointer
                             let frame = bpm.as_mut().fetch_page(current_page_id)?;
                             let frame_id = frame.fid();
                             let mut page_view = frame.page_view();
@@ -372,8 +378,6 @@ impl BplusTree {
                             return Ok(SplitData::NoSplit);
                         }
 
-                        // Hard case: This inner page is also full, must split
-                        // 1. Fetch old page, call split, get new entries, and unpin
                         let (key_to_push_up, new_page_keys, new_page_children, old_next_sibling_id) = {
                             let frame = bpm.as_mut().fetch_page(current_page_id)?;
                             let frame_id = frame.fid();
@@ -385,7 +389,6 @@ impl BplusTree {
 
                             let split_data =
                                 inner_page.split_and_get_new_entries(&new_key, new_child_page_id);
-
                             let old_next_sibling_id = inner_page.next_sibling();
 
                             bpm.as_mut().mark_frame_dirty(frame_id);
@@ -397,17 +400,19 @@ impl BplusTree {
                                 split_data.new_page_children,
                                 old_next_sibling_id,
                             )
-                        }; // --- old_frame borrow ends ---
+                        };
 
-                        // 2. Allocate new page, fill it, and unpin
                         let new_page_id =
                             PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1)
                                 .unwrap();
-                        {
+
+                        let new_page_offset = {
                             let new_frame = bpm
                                 .as_mut()
                                 .alloc_new_page(PageKind::BPlusInner, new_page_id)?;
                             let new_frame_id = new_frame.fid();
+                            let new_offset = new_frame.file_offset();
+
                             let mut new_page_view = new_frame.page_view();
                             let new_inner = match &mut new_page_view {
                                 Page::BPlusInner(inner) => inner,
@@ -416,13 +421,10 @@ impl BplusTree {
 
                             new_inner.init(new_page_id, level);
                             new_inner.set_key_size(self.key_size);
-
-                            // Set first child
                             new_inner.set_child_at(0, new_page_children[0]);
                             let free_space = new_inner.free_space();
                             new_inner.set_free_space(free_space - 8);
 
-                            // Insert remaining keys and children
                             for i in 0..new_page_keys.len() {
                                 new_inner
                                     .insert_sorted(&new_page_keys[i], new_page_children[i + 1]);
@@ -433,9 +435,17 @@ impl BplusTree {
 
                             bpm.as_mut().mark_frame_dirty(new_frame_id);
                             bpm.as_mut().unpin_frame(new_frame_id)?;
-                        } // --- new_frame borrow ends ---
 
-                        // 3. Re-fetch old page to update its next_sibling pointer
+                            new_offset
+                        };
+
+                        self.register_page(
+                            new_page_id,
+                            new_page_offset,
+                            bpm.as_mut(),
+                            page_id_counter,
+                        )?;
+
                         {
                             let old_frame = bpm.as_mut().fetch_page(current_page_id)?;
                             let old_frame_id = old_frame.fid();
@@ -448,9 +458,8 @@ impl BplusTree {
                                 _ => return Err(BTreeError::InvalidPageType),
                             }
                             bpm.as_mut().unpin_frame(old_frame_id)?;
-                        } // --- old_frame borrow ends ---
+                        }
 
-                        // 4. Update the *next* sibling's prev pointer if it exists
                         if let Some(next_id) = old_next_sibling_id {
                             let next_frame = bpm.as_mut().fetch_page(next_id)?;
                             let next_frame_id = next_frame.fid();
@@ -463,9 +472,8 @@ impl BplusTree {
                                 _ => return Err(BTreeError::InvalidPageType),
                             }
                             bpm.as_mut().unpin_frame(next_frame_id)?;
-                        } // --- next_frame borrow ends ---
+                        }
 
-                        // 7. Return split info to *our* parent
                         Ok(SplitData::Split {
                             key: key_to_push_up,
                             right_page_id: new_page_id,
@@ -473,31 +481,131 @@ impl BplusTree {
                     }
                 }
             }
-            // This case is now handled by the main match
             PageKind::Invalid => Err(BTreeError::InvalidPageType),
-            _ => Err(BTreeError::InvalidPageType), // Other page types
+            _ => Err(BTreeError::InvalidPageType),
+        }
+    }
+
+    fn delete_internal(
+        &mut self,
+        current_page_id: PageId,
+        key: &[u8],
+        mut bpm: Pin<&mut BufferPool>,
+    ) -> Result<DeleteResult, BTreeError> {
+        let frame = bpm.as_mut().fetch_page(current_page_id)?;
+        let frame_id = frame.fid();
+        let mut page_view = frame.page_view();
+
+        match &mut page_view {
+            Page::BPlusLeaf(leaf_page) => {
+                let key_size = leaf_page.get_key_size() as usize;
+                if key.len() != key_size {
+                    bpm.as_mut().unpin_frame(frame_id)?;
+                    return Err(BTreeError::SplitError("Key length mismatch".to_string()));
+                }
+
+                // Check if the key we are deleting is the first key
+                let is_first_key = if let Some(first_key) = leaf_page.get_first_key() {
+                    first_key == key
+                } else {
+                    false
+                };
+
+                // Try to remove the key
+                if leaf_page.remove_key(key) {
+                    let result = if is_first_key {
+                        if let Some(new_first_key) = leaf_page.get_first_key() {
+                            DeleteResult::DeletedAndPromote(new_first_key)
+                        } else {
+                            DeleteResult::Deleted // Page is empty
+                        }
+                    } else {
+                        DeleteResult::Deleted
+                    };
+
+                    bpm.as_mut().mark_frame_dirty(frame_id);
+                    bpm.as_mut().unpin_frame(frame_id)?;
+                    Ok(result)
+                } else {
+                    // Key not found, just unpin.
+                    bpm.as_mut().unpin_frame(frame_id)?;
+                    Ok(DeleteResult::NotFound)
+                }
+            }
+            Page::BPlusInner(inner_page) => {
+                // 1. Find the correct child to descend into
+                let child_index = inner_page.find_child_page_index(key);
+                let child_page_id = inner_page
+                    .get_child_at(child_index)
+                    .ok_or(BTreeError::PageNotFound)?;
+
+                // We unpin the parent *before* recursing to the child to avoid
+                // deadlocking if the child needs to fetch a sibling
+                bpm.as_mut().unpin_frame(frame_id)?;
+
+                // 2. Recurse
+                let delete_result = self.delete_internal(child_page_id, key, bpm.as_mut())?;
+
+                // 3. Handle result: Check if we need to update a parent key
+                match delete_result {
+                    DeleteResult::DeletedAndPromote(new_key) => {
+                        // The child's first key changed, so we must update
+                        // the separator key in this node.
+
+                        // The key to update is at child_index - 1
+                        if child_index > 0 {
+                            let key_index = child_index - 1;
+
+                            // Re-fetch this inner page to modify it
+                            let frame = bpm.as_mut().fetch_page(current_page_id)?;
+                            let frame_id = frame.fid();
+                            let mut page_view = frame.page_view();
+
+                            if let Page::BPlusInner(inner_page) = &mut page_view {
+                                // We replace the old key with the new promoted key
+                                inner_page.set_entry(key_index, &new_key, child_page_id);
+                                bpm.as_mut().mark_frame_dirty(frame_id);
+                                bpm.as_mut().unpin_frame(frame_id)?;
+                            } else {
+                                bpm.as_mut().unpin_frame(frame_id)?;
+                                return Err(BTreeError::InvalidPageType);
+                            }
+                        }
+
+                        // This node's keys changed, but its *own* first key did not.
+                        // So we just pass the result up.
+                        Ok(DeleteResult::Deleted)
+                    }
+                    _ => {
+                        // Child handled it, no changes to this node.
+                        Ok(delete_result)
+                    }
+                }
+            }
+            _ => {
+                bpm.as_mut().unpin_frame(frame_id)?;
+                Err(BTreeError::InvalidPageType)
+            }
         }
     }
 }
 
 #[cfg(test)]
 pub mod bplus_tests {
-    // Add 'pub' to the module
     use super::*;
     use crate::constants;
-    use crate::storage::bplus_tree::BplusTree;
     use crate::storage::bplus_tree::buffer_pool::errors::FlushFrameError;
     use crate::storage::buffer::fifo_evictor::FifoEvictor;
     use crate::storage::disk::FileManager;
     use crate::storage::page::base::Page;
     use crate::storage::page::base::{PageId, PageKind};
-    use crate::storage::page_locator::locator::{self};
+    use crate::storage::page_locator::locator::DirectoryPageLocator;
+    use std::alloc::{Layout, alloc};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     const FRAME_COUNT: usize = 128;
 
-    // Add 'pub'
     pub fn setup_buffer_pool_test(test_name: &str) -> (PathBuf, Pin<Box<BufferPool>>, AtomicU64) {
         let mut temp_dir = std::env::temp_dir();
         temp_dir.push(format!("nimbus_test_{}.db", test_name));
@@ -510,36 +618,49 @@ pub mod bplus_tests {
             FileManager::new(temp_file_str.to_string()).expect("Failed to create FileManager");
 
         let evictor = Box::new(FifoEvictor::new());
-
-        let page_locator = Box::new(locator::DirectoryPageLocator::new());
+        let page_locator = Box::new(DirectoryPageLocator::new());
 
         let buffer_pool = Box::pin(BufferPool::new(file_manager, evictor, page_locator));
 
-        // Start counter at 1, since 0 is reserved for file manager
-        // And PageId 1 will be the root.
-        let page_id_cnt = AtomicU64::new(1);
+        let page_id_cnt = AtomicU64::new(0);
         (temp_file_path, buffer_pool, page_id_cnt)
     }
+
     fn setup_bplus_tree_test(
         test_name: &str,
         key_size: u32,
     ) -> (
         BplusTree,
-        Pin<Box<crate::storage::buffer::BufferPool>>,
+        Pin<Box<BufferPool>>,
         std::path::PathBuf,
         std::sync::atomic::AtomicU64,
     ) {
         let (temp_path, mut buffer_pool, page_id_counter) = setup_buffer_pool_test(test_name);
 
-        // 1. Allocate the first page (root page)
-        // PageId 1 is the first one from the counter
-        let root_page_id = PageId::new(page_id_counter.load(Ordering::SeqCst)).unwrap();
+        // Create directory page at offset 0
+        let dir_page_id = PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1).unwrap();
+        let dir_frame = buffer_pool
+            .as_mut()
+            .alloc_new_page(PageKind::Directory, dir_page_id)
+            .expect("Failed to allocate directory page");
+
+        let dir_frame_id = dir_frame.fid();
+        let mut dir_page_view = dir_frame.page_view();
+        if let Page::Directory(dir_page) = &mut dir_page_view {
+            dir_page.set_page_id(dir_page_id);
+        }
+        buffer_pool.as_mut().mark_frame_dirty(dir_frame_id);
+        buffer_pool.as_mut().unpin_frame(dir_frame_id).unwrap();
+
+        // Create root page
+        let root_page_id = PageId::new(page_id_counter.fetch_add(1, Ordering::SeqCst) + 1).unwrap();
 
         let mut root_frame = buffer_pool
             .as_mut()
             .alloc_new_page(PageKind::BPlusLeaf, root_page_id)
             .expect("Failed to allocate root page");
 
+        let root_offset = root_frame.file_offset();
         let root_frame_id = root_frame.fid();
         let mut page_view = root_frame.page_view();
         let root_page = match &mut page_view {
@@ -547,28 +668,28 @@ pub mod bplus_tests {
             _ => panic!("Root page was not a leaf page"),
         };
 
-        // 2. Initialize the root page
         root_page.init(root_page_id);
         root_page.set_key_size(key_size);
 
-        // 3. Mark dirty and unpin
         buffer_pool.as_mut().mark_frame_dirty(root_frame_id);
         buffer_pool.as_mut().unpin_frame(root_frame_id).unwrap();
 
-        // 4. Create the BplusTree struct
+        // Register root page in directory
+        buffer_pool
+            .as_mut()
+            .register_page_in_directory(root_page_id, root_offset, 0)
+            .expect("Failed to register root page");
+
         let btree = BplusTree::new(root_page_id, key_size);
 
         (btree, buffer_pool, temp_path, page_id_counter)
     }
 
-    // Add 'pub'
     pub fn generate_test_page_id(counter: &AtomicU64) -> PageId {
-        // ID start from 1.
         let next_id = counter.fetch_add(1, Ordering::SeqCst) + 1;
         PageId::new(next_id).expect("Page ID counter overflowed in test")
     }
 
-    // Add 'pub'
     pub fn cleanup_temp_file(temp_file_path: &PathBuf) {
         let _ = fs::remove_file(temp_file_path);
     }
@@ -629,21 +750,27 @@ pub mod bplus_tests {
 
         let page_id_on_disk = PageId::new(100).unwrap();
         let offset_on_disk: u64 = 0;
-        let mut page_buf_disk = [0u8; constants::storage::PAGE_SIZE];
+        let layout =
+            Layout::from_size_align(constants::storage::PAGE_SIZE, constants::storage::PAGE_SIZE)
+                .expect("Failed to create layout");
+        let page_buf_disk_ptr = unsafe { alloc(layout) };
+        if page_buf_disk_ptr.is_null() {
+            panic!("Failed to allocate aligned memory for test");
+        }
+
+        let page_buf_disk =
+            unsafe { &mut *(page_buf_disk_ptr as *mut [u8; constants::storage::PAGE_SIZE]) };
 
         {
             let mut fm_direct = FileManager::new(temp_path.to_str().unwrap().to_string()).unwrap();
 
-            // Initialize buffer for SlottedData page
-            page::base::init_page_buf(&mut page_buf_disk, PageKind::SlottedData);
-            // Need to set PageId manually in the buffer
+            page::base::init_page_buf(page_buf_disk, PageKind::SlottedData);
             page_buf_disk[8..16].copy_from_slice(&page_id_on_disk.get().to_le_bytes());
 
-            // Write this buffer directly to the file
             fm_direct
-                .write_block_from(offset_on_disk, &page_buf_disk)
+                .write_block_from(offset_on_disk, &page_buf_disk[..])
                 .expect("Failed to write initial page directly to disk");
-        } // fm_direct goes out of scope, file is closed
+        }
 
         // fetch the page using the buffer pool, should be a cache miss
         let frame_result = buffer_pool.as_mut().fetch_page_at_offset(offset_on_disk);
@@ -998,11 +1125,9 @@ pub mod bplus_tests {
         let key = 100u64.to_le_bytes();
         let value = 12345u64;
 
-        // --- Insert ---
         let insert_res = btree.insert(&key, value, buffer_pool.as_mut(), &page_id_counter);
         assert!(insert_res.is_ok(), "Insert failed: {:?}", insert_res.err());
 
-        // --- Find ---
         let find_res = btree.find(&key, buffer_pool.as_mut());
         assert!(find_res.is_ok(), "Find failed: {:?}", find_res.err());
 
@@ -1010,7 +1135,6 @@ pub mod bplus_tests {
         assert!(found_val.is_some(), "Key not found after insert");
         assert_eq!(found_val.unwrap(), value, "Value mismatch");
 
-        // --- Find non-existent key ---
         let key_nonexist = 999u64.to_le_bytes();
         let find_res_none = btree.find(&key_nonexist, buffer_pool.as_mut());
         assert!(
@@ -1028,16 +1152,15 @@ pub mod bplus_tests {
 
     #[test]
     fn test_btree_leaf_split() {
-        const KEY_SIZE: u32 = 8; // 8 byte key
+        const KEY_SIZE: u32 = 8;
         let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
             setup_bplus_tree_test("leaf_split", KEY_SIZE);
 
         let max_keys = {
             let root_page_id = btree.get_root_page_id();
             let frame = buffer_pool.as_mut().fetch_page(root_page_id).unwrap();
-            let mut page_view = frame.page_view(); // <-- FIX: added mut
+            let mut page_view = frame.page_view();
             let max = match &mut page_view {
-                // <-- FIX: added &mut
                 Page::BPlusLeaf(leaf) => leaf.calculate_max_keys(),
                 _ => panic!("Root is not leaf"),
             };
@@ -1049,7 +1172,6 @@ pub mod bplus_tests {
         let num_keys_to_insert = max_keys + 1;
         let mut keys = Vec::new();
 
-        // --- Insert ---
         for i in 0..num_keys_to_insert {
             let key = (i as u64).to_le_bytes();
             let value = (i as u64) * 10;
@@ -1064,17 +1186,13 @@ pub mod bplus_tests {
             );
         }
 
-        // --- Check that root page changed ---
-        // A leaf split should create a new root (an inner page).
         let new_root_id = btree.get_root_page_id();
         assert_ne!(
             new_root_id.get(),
-            1,
+            2,
             "Root Page ID should have changed after a split"
         );
 
-        // --- Find ---
-        // Verify all keys can be found
         for (key, value) in keys {
             let find_res = btree.find(&key, buffer_pool.as_mut());
             assert!(
@@ -1098,6 +1216,111 @@ pub mod bplus_tests {
     }
 
     #[test]
+    fn test_btree_delete_and_promote_key() {
+        const KEY_SIZE: u32 = 8;
+        let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
+            setup_bplus_tree_test("delete_and_promote", KEY_SIZE);
+
+        // 1. Determine max keys to force a split
+        let max_keys = {
+            let root_page_id = btree.get_root_page_id();
+            let frame = buffer_pool.as_mut().fetch_page(root_page_id).unwrap();
+            let mut page_view = frame.page_view();
+            let max = match &mut page_view {
+                Page::BPlusLeaf(leaf) => leaf.calculate_max_keys(),
+                _ => panic!("Root is not leaf"),
+            };
+            let fr_id = frame.fid();
+            buffer_pool.as_mut().unpin_frame(fr_id).unwrap();
+            max as usize
+        };
+
+        // 2. Insert keys to trigger a leaf split
+        let num_keys_to_insert = max_keys + 1;
+        for i in 0..num_keys_to_insert {
+            let key = (i as u64).to_le_bytes();
+            let value = (i as u64) * 10;
+            btree
+                .insert(&key, value, buffer_pool.as_mut(), &page_id_counter)
+                .expect(&format!("Insert failed for key {}", i));
+        }
+
+        // After this, the tree has split.
+        // The split point is `num_keys_to_insert / 2`.
+        // e.g., if max_keys = 10, we insert 11 keys (0-10). Split point is 5.
+        // Root (Inner): [Key(5)]
+        // Left Leaf:  [0, 1, 2, 3, 4]
+        // Right Leaf: [5, 6, 7, 8, 9, 10]
+        let split_point = num_keys_to_insert / 2;
+        let key_to_delete_val = split_point as u64; // This is the first key in the right leaf
+        let new_promoted_key_val = (split_point + 1) as u64; // This will be the new first key
+        let key_before_split_val = (split_point - 1) as u64; // A key in the left leaf
+
+        let key_to_delete_bytes = key_to_delete_val.to_le_bytes();
+        let new_promoted_key_bytes = new_promoted_key_val.to_le_bytes();
+        let key_before_split_bytes = key_before_split_val.to_le_bytes();
+
+        // 3. Delete the first key of the right leaf
+        btree
+            .delete(&key_to_delete_bytes, buffer_pool.as_mut())
+            .expect("Delete failed");
+
+        // 4. Verify the key is gone
+        let find_res = btree
+            .find(&key_to_delete_bytes, buffer_pool.as_mut())
+            .unwrap();
+        assert!(
+            find_res.is_none(),
+            "Deleted key {:?} was still found",
+            key_to_delete_val
+        );
+
+        // 5. Verify other keys are still present
+        let find_res_before = btree
+            .find(&key_before_split_bytes, buffer_pool.as_mut())
+            .unwrap();
+        assert_eq!(
+            find_res_before.unwrap(),
+            key_before_split_val * 10,
+            "Key before split was not found"
+        );
+
+        let find_res_after = btree
+            .find(&new_promoted_key_bytes, buffer_pool.as_mut())
+            .unwrap();
+        assert_eq!(
+            find_res_after.unwrap(),
+            new_promoted_key_val * 10,
+            "New first key was not found"
+        );
+
+        // 6. Verify the parent inner node's key was promoted and updated
+        let root_id = btree.get_root_page_id();
+        let root_frame = buffer_pool.as_mut().fetch_page(root_id).unwrap();
+        let root_fid = root_frame.fid();
+        let mut page_view = root_frame.page_view();
+
+        if let Page::BPlusInner(inner_page) = &mut page_view {
+            assert_eq!(
+                inner_page.curr_vec_sz(),
+                1,
+                "Root should still have 1 separator key"
+            );
+            let separator_key = inner_page.get_key_at(0);
+            assert_eq!(
+                separator_key,
+                &new_promoted_key_bytes[..],
+                "Parent separator key was not correctly promoted"
+            );
+        } else {
+            panic!("Root page was not an BPlusInner page after split");
+        }
+        buffer_pool.as_mut().unpin_frame(root_fid).unwrap();
+
+        cleanup_temp_file(&temp_path);
+    }
+
+    #[test]
     fn test_btree_duplicate_insert() {
         const KEY_SIZE: u32 = 8;
         let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
@@ -1107,7 +1330,6 @@ pub mod bplus_tests {
         let value1 = 12345u64;
         let value2 = 67890u64;
 
-        // --- Insert first value ---
         let insert_res1 = btree.insert(&key, value1, buffer_pool.as_mut(), &page_id_counter);
         assert!(
             insert_res1.is_ok(),
@@ -1115,11 +1337,9 @@ pub mod bplus_tests {
             insert_res1.err()
         );
 
-        // --- Find first value ---
         let find_res1 = btree.find(&key, buffer_pool.as_mut()).unwrap().unwrap();
         assert_eq!(find_res1, value1);
 
-        // --- Insert second value (update) ---
         let insert_res2 = btree.insert(&key, value2, buffer_pool.as_mut(), &page_id_counter);
         assert!(
             insert_res2.is_ok(),
@@ -1127,7 +1347,6 @@ pub mod bplus_tests {
             insert_res2.err()
         );
 
-        // --- Find second value ---
         let find_res2 = btree.find(&key, buffer_pool.as_mut()).unwrap().unwrap();
         assert_eq!(
             find_res2, value2,
@@ -1137,24 +1356,20 @@ pub mod bplus_tests {
         cleanup_temp_file(&temp_path);
     }
 
-    #[test]
     fn test_btree_inner_page_split() {
-        const KEY_SIZE: u32 = 8; // 8 byte key
+        const KEY_SIZE: u32 = 8;
         let (mut btree, mut buffer_pool, temp_path, page_id_counter) =
             setup_bplus_tree_test("inner_split", KEY_SIZE);
 
-        // 1. Get max keys for leaf and inner pages
         let (max_leaf_keys, max_inner_keys) = {
             let root_page_id = btree.get_root_page_id();
             let frame = buffer_pool.as_mut().fetch_page(root_page_id).unwrap();
-            let mut page_view = frame.page_view(); // <-- FIX: added mut
+            let mut page_view = frame.page_view();
             let leaf_max = match &mut page_view {
-                // <-- FIX: added &mut
                 Page::BPlusLeaf(leaf) => leaf.calculate_max_keys(),
                 _ => panic!("Root is not leaf"),
             } as usize;
 
-            // We'll create a dummy buffer to calculate this
             let mut dummy_buf = [0u8; constants::storage::PAGE_SIZE];
             let mut inner_page = crate::storage::page::bplus_inner::BPlusInner::new(&mut dummy_buf);
             inner_page.set_key_size(KEY_SIZE);
@@ -1165,9 +1380,6 @@ pub mod bplus_tests {
             (leaf_max, inner_max)
         };
 
-        // We need to trigger `max_inner_keys + 1` leaf splits to split the root inner page.
-        // Each leaf split happens after `max_leaf_keys` inserts.
-        // Let's use the split point, which is roughly max_keys / 2.
         let keys_per_leaf_split = (max_leaf_keys / 2) + 1;
         let num_leaf_splits_needed = max_inner_keys + 1;
         let num_keys_to_insert = keys_per_leaf_split * num_leaf_splits_needed + 1;
@@ -1183,7 +1395,6 @@ pub mod bplus_tests {
 
         let mut keys = Vec::new();
 
-        // --- Insert ---
         for i in 0..num_keys_to_insert {
             let key = (i as u64).to_le_bytes();
             let value = (i as u64) * 10;
@@ -1195,10 +1406,6 @@ pub mod bplus_tests {
             }
         }
 
-        // --- Check tree height ---
-        // Original root (Page 1) was height 0.
-        // First split creates root (Page 2, inner) at height 1.
-        // Inner split creates root (Page N) at height 2.
         let root_id = btree.get_root_page_id();
         let root_frame = buffer_pool.as_mut().fetch_page(root_id).unwrap();
         let root_height = match root_frame.page_view() {
@@ -1213,8 +1420,6 @@ pub mod bplus_tests {
             "Tree height should be 2 after inner page split"
         );
 
-        // --- Find ---
-        // Verify all keys can be found
         println!("Verifying {} keys...", keys.len());
         for (key, value) in keys {
             let find_res = btree.find(&key, buffer_pool.as_mut());
@@ -1244,7 +1449,6 @@ pub mod bplus_tests {
         let num_keys = 1000;
         let mut keys = Vec::new();
 
-        // --- Insert ---
         for i in 0..num_keys {
             let key = (i as u64).to_le_bytes();
             let value = (i as u64) * 10;
@@ -1254,7 +1458,6 @@ pub mod bplus_tests {
                 .unwrap();
         }
 
-        // --- Find ---
         for (key, value) in keys {
             let find_res = btree.find(&key, buffer_pool.as_mut()).unwrap();
             assert!(find_res.is_some(), "Key not found: {:?}", key);

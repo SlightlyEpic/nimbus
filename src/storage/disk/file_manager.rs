@@ -11,11 +11,7 @@ pub struct FileManager {
 
 impl FileManager {
     pub fn new(file_path: String) -> io::Result<Self> {
-        let path = Path::new(&file_path);
 
-        if !path.exists() {
-            File::create(path)?;
-        }
 
         if cfg!(windows) {
             panic!("Non UNIX systems are not supported");
@@ -24,6 +20,7 @@ impl FileManager {
         let file = File::options()
             .read(true)
             .write(true)
+            .create(true)
             .custom_flags(libc::O_DIRECT)
             .open(&file_path)?;
 
@@ -31,10 +28,9 @@ impl FileManager {
     }
 
     /// buf: Should be a PageBuf slice
-    pub fn read_block_into(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    pub unsafe fn read_block_into(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let byte_offset = offset * constants::storage::PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(byte_offset))?;
-        // SAFETY: buf must be 4K aligned and length multiple of 512 (kernel requirement).
         self.file.read_exact(buf)?;
 
         Ok(())
