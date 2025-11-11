@@ -64,7 +64,6 @@ impl<'a> BPlusLeaf<'a> {
     }
 
     /// Writes a key-value entry to the given logical index.
-    /// Assumes space has already been allocated (e.g., by shifting).
     fn set_entry(&mut self, index: usize, key: &[u8], value: u64) {
         let key_size = self.get_key_size() as usize;
         let entry_size = self.entry_size();
@@ -152,18 +151,37 @@ impl<'a> BPlusLeaf<'a> {
                 .expect("Invalid key_size offset"),
         )
     }
+
+    pub fn min_keys(&self) -> u32 {
+        // A B+ Tree node must be at least 50% full (except root)
+        // (max_keys + 1) / 2 corresponds to ceil(max_keys / 2)
+        (self.calculate_max_keys() + 1) / 2
+    }
+
+    pub fn is_underflow(&self) -> bool {
+        self.curr_vec_sz() < self.min_keys()
+    }
+
+    pub fn can_give_key(&self) -> bool {
+        self.curr_vec_sz() > self.min_keys()
+    }
+
     pub fn set_page_kind(&mut self, kind: base::PageKind) {
         self.raw[0] = kind as u8;
     }
+
     pub fn set_free_space(&mut self, free: u32) {
         self.raw[4..8].copy_from_slice(&free.to_le_bytes());
     }
+
     pub fn set_page_id(&mut self, id: base::PageId) {
         self.raw[8..16].copy_from_slice(&id.get().to_le_bytes());
     }
+
     pub fn set_level(&mut self, level: u16) {
         self.raw[1..3].copy_from_slice(&level.to_le_bytes());
     }
+
     pub fn set_prev_sibling(&mut self, id: Option<base::PageId>) {
         let bytes = match id {
             Some(page_id) => page_id.get().to_le_bytes(),
@@ -171,6 +189,7 @@ impl<'a> BPlusLeaf<'a> {
         };
         self.raw[16..24].copy_from_slice(&bytes);
     }
+
     pub fn set_next_sibling(&mut self, id: Option<base::PageId>) {
         let bytes = match id {
             Some(page_id) => page_id.get().to_le_bytes(),
@@ -178,9 +197,11 @@ impl<'a> BPlusLeaf<'a> {
         };
         self.raw[24..32].copy_from_slice(&bytes);
     }
+
     pub fn set_curr_vec_sz(&mut self, size: u32) {
         self.raw[32..36].copy_from_slice(&size.to_le_bytes());
     }
+
     pub fn set_key_size(&mut self, key_size: u32) {
         self.raw[36..40].copy_from_slice(&key_size.to_le_bytes());
     }
@@ -301,20 +322,6 @@ impl<'a> BPlusLeaf<'a> {
         None
     }
 
-    /// Check if the node is below the minimum occupancy threshold
-    pub fn is_underflow(&self) -> bool {
-        let max_keys = self.calculate_max_keys();
-        let min_keys = (max_keys + 1) / 2; // Ceiling of max_keys / 2
-        self.curr_vec_sz() < min_keys
-    }
-
-    /// Check if the node can give a key to a sibling (has more than minimum)
-    pub fn can_give_key(&self) -> bool {
-        let max_keys = self.calculate_max_keys();
-        let min_keys = (max_keys + 1) / 2;
-        self.curr_vec_sz() > min_keys
-    }
-
     /// Calculate maximum number of keys this leaf can hold
     pub fn calculate_max_keys(&self) -> u32 {
         if self.get_key_size() == 0 {
@@ -365,7 +372,6 @@ impl<'a> BPlusLeaf<'a> {
 
         let split_point = total_entries / 2;
 
-        // --- Rebuild this (left) page ---
         // Clear the data area
         self.raw[Self::DATA_START..].fill(0);
 
@@ -452,9 +458,41 @@ impl<'a> BPlusLeaf<'a> {
         }
     }
 
+    /// Move the last key-value pair to the beginning of the target leaf
+    /// Returns the key that was moved.
+    pub fn move_last_to_beginning_of(&mut self, target: &mut BPlusLeaf) -> Vec<u8> {
+        let curr_size = self.curr_vec_sz() as usize;
+
+        let last_key = self.get_key_at(curr_size - 1).to_vec();
+        let last_value = self.get_value_at(curr_size - 1);
+
+        // Remove from this leaf
+        self.remove_key(&last_key);
+
+        // Insert into target at the beginning
+        target.insert_at_beginning(&last_key, last_value);
+
+        last_key
+    }
+
+    /// Move the first key-value pair to the end of the target leaf
+    /// Returns the *new* first key of this leaf (for parent update)
+    pub fn move_first_to_end_of(&mut self, target: &mut BPlusLeaf) -> Vec<u8> {
+        let first_key = self.get_key_at(0).to_vec();
+        let first_value = self.get_value_at(0);
+
+        // Remove from this leaf first
+        self.remove_key(&first_key);
+
+        // Insert into target at the end (insert_sorted handles this)
+        target.insert_sorted(&first_key, first_value);
+
+        // Return the new first key of this leaf
+        self.get_key_at(0).to_vec()
+    }
+
     /// Insert a key-value pair at the beginning of the leaf
     fn insert_at_beginning(&mut self, key: &[u8], value: u64) {
-        let key_size = self.get_key_size() as usize;
         let curr_size = self.curr_vec_sz() as usize;
         let entry_size = self.entry_size();
 
@@ -469,26 +507,22 @@ impl<'a> BPlusLeaf<'a> {
         // Insert at position 0
         self.set_entry(0, key, value);
 
-        // Update metadata
         self.set_curr_vec_sz((curr_size + 1) as u32);
         let free_space = self.free_space();
         self.set_free_space(free_space - (entry_size as u32));
     }
 
-    /// Merge all entries from another leaf into this one
-    pub fn merge_from(&mut self, other: &mut BPlusLeaf) {
-        let other_size = other.curr_vec_sz() as usize;
-        if other_size == 0 {
-            return;
-        }
-
+    /// Merge all entries from `other_leaf` into this one
+    pub fn merge_from(&mut self, other_leaf: &mut BPlusLeaf) {
+        let other_size = other_leaf.curr_vec_sz() as usize;
         for i in 0..other_size {
-            let key = other.get_key_at(i);
-            let value = other.get_value_at(i);
+            let key = other_leaf.get_key_at(i);
+            let value = other_leaf.get_value_at(i);
             self.insert_sorted(key, value);
         }
 
-        other.set_curr_vec_sz(0);
-        other.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
+        other_leaf.set_curr_vec_sz(0);
+        other_leaf.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
+        self.set_next_sibling(other_leaf.next_sibling());
     }
 }

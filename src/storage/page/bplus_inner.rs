@@ -40,7 +40,7 @@ impl<'a> BPlusInner<'a> {
     //  Z.. PAGE_SIZE -> Free Space
     //
     // Note: An inner page with N keys has N+1 children.
-    // Child 0 is `First Child Page ID`.
+    // Child 0 is First Child Page ID.
     // Child i (for i > 0) is the Page ID in Entry (i-1).
 
     const HEADER_END: usize = 64;
@@ -375,8 +375,8 @@ impl<'a> BPlusInner<'a> {
             }
         }
 
-        // `left` is now the index of the first key *greater* than or equal to `key`.
-        // This means we should follow the child pointer at index `left`.
+        // left is now the index of the first key greater than or equal to key.
+        // This means we should follow the child pointer at index left.
         child_index = left;
 
         self.get_child_at(child_index)
@@ -444,8 +444,140 @@ impl<'a> BPlusInner<'a> {
                 left = mid + 1;
             }
         }
-        // `left` is now the index of the first key >= `key`.
-        // This means we should follow the child pointer at index `left`.
+        // left is now the index of the first key >= key.
+        // This means we should follow the child pointer at index left.
         left
+    }
+
+    pub fn min_keys(&self) -> u32 {
+        // (max_keys + 1) / 2 corresponds to ceil(max_keys / 2)
+        (self.calculate_max_keys() + 1) / 2
+    }
+
+    /// Check if the node is below the minimum occupancy threshold
+    pub fn is_underflow(&self) -> bool {
+        self.curr_vec_sz() < self.min_keys()
+    }
+
+    /// Check if the node can give a key to a sibling (has more than minimum)
+    pub fn can_give_key(&self) -> bool {
+        self.curr_vec_sz() > self.min_keys()
+    }
+
+    /// Moves the last key/child pair from this node to the beginning of target node.
+    /// This also requires moving the separator_key from the parent down into the target.
+    /// Returns the key that was at the end of this node.
+    pub fn move_last_to_beginning_of(
+        &mut self,
+        target: &mut BPlusInner,
+        separator_key: &[u8],
+    ) -> Vec<u8> {
+        let curr_size = self.curr_vec_sz() as usize;
+
+        // Get the last key and child from this node
+        let last_key = self.get_key_at(curr_size - 1).to_vec();
+        let last_child = self.get_child_id_at_entry(curr_size - 1);
+
+        // Remove the last entry from this node
+        self.set_curr_vec_sz((curr_size - 1) as u32);
+        self.set_free_space(self.free_space() + self.entry_size() as u32);
+
+        // Now, update the target node
+        let target_old_first_child = target.get_child_at(0).unwrap();
+
+        // The target's *new* first key will be the separator_key from the parent
+        // The child associated with this new key will be the target_old_first_child
+        target.insert_at_beginning(separator_key, target_old_first_child);
+
+        // Finally, set the target's first child to be the last_child we moved
+        target.set_child_at(0, last_child);
+
+        // Return the key we removed, which will become the new separator in the parent
+        last_key
+    }
+
+    /// Moves the first key/child pair from this node to the end of target node.
+    /// This also requires moving the separator_key from the parent down into the target.
+    /// Returns the new first key of this node (which will be the new separator).
+    pub fn move_first_to_end_of(
+        &mut self,
+        target: &mut BPlusInner,
+        separator_key: &[u8],
+    ) -> Vec<u8> {
+        let curr_size = self.curr_vec_sz() as usize;
+
+        // Get the first key and its *associated child* (which is at index 1)
+        let first_key = self.get_key_at(0).to_vec();
+        let first_key_child = self.get_child_id_at_entry(0);
+
+        // Get the *very first child* (index 0), which will become the new first child
+        let new_first_child = self.get_child_at(0).unwrap();
+
+        // 1. Add to target: The parent's separator key and this node's first key's child
+        target.insert_sorted(separator_key, first_key_child);
+
+        // 2. Remove from this node
+        // Shift all entries left by one
+        let entry_size = self.entry_size();
+        let offset = Self::DATA_START;
+        let move_len = (curr_size - 1) * entry_size;
+        self.raw
+            .copy_within(offset + entry_size..offset + entry_size + move_len, offset);
+
+        // Set the new first child
+        self.set_child_at(0, new_first_child);
+
+        // Update metadata
+        self.set_curr_vec_sz((curr_size - 1) as u32);
+        self.set_free_space(self.free_space() + entry_size as u32);
+
+        // Return the key that was removed, which becomes the new separator
+        first_key
+    }
+
+    /// Insert a key-child_id pair at the beginning of the node's entries.
+    /// This is used when borrowing from a left sibling.
+    fn insert_at_beginning(&mut self, key: &[u8], child_id: base::PageId) {
+        let curr_size = self.curr_vec_sz() as usize;
+        let entry_size = self.entry_size();
+
+        // Shift all entries right by one
+        if curr_size > 0 {
+            let offset = Self::DATA_START;
+            let move_len = curr_size * entry_size;
+            self.raw
+                .copy_within(offset..offset + move_len, offset + entry_size);
+        }
+
+        // Insert at position 0
+        self.set_entry(0, key, child_id);
+
+        // Update metadata
+        self.set_curr_vec_sz((curr_size + 1) as u32);
+        let free_space = self.free_space();
+        self.set_free_space(free_space - (entry_size as u32));
+    }
+
+    /// Merge all entries from other_node into this one.
+    /// This also requires pulling down the separator_key from the parent.
+    pub fn merge_from(&mut self, other_node: &mut BPlusInner, separator_key: &[u8]) {
+        let other_size = other_node.curr_vec_sz() as usize;
+
+        // Pull down the separator key from the parent.
+        // Its child will be the first child of the other_node.
+        let other_first_child = other_node.get_child_at(0).unwrap();
+        self.insert_sorted(separator_key, other_first_child);
+
+        // Copy all key/child entries from the other_node
+        for i in 0..other_size {
+            let key = other_node.get_key_at(i);
+            let child = other_node.get_child_id_at_entry(i);
+            self.insert_sorted(key, child);
+        }
+
+        // Clear the other node
+        other_node.set_curr_vec_sz(0);
+        other_node.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
+        self.set_next_sibling(other_node.next_sibling());
     }
 }
