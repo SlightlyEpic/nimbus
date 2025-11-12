@@ -322,10 +322,6 @@ impl BufferPoolCore {
                 .map_err(|_| errors::AllocNewPageError::IOError)?
         };
 
-        unsafe {
-            std::ptr::write_bytes(buf_ptr, 0, 1);
-        }
-
         let frame = unsafe {
             self.as_mut().get_unchecked_mut().frames[frame_idx]
                 .as_mut()

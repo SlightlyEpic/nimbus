@@ -10,6 +10,7 @@ use std::num::NonZeroU64;
 pub type PageBuf = [u8; constants::storage::PAGE_SIZE];
 
 // #anchor-pagekind-values
+#[derive(Debug, Copy, Clone)]
 pub enum PageKind {
     Invalid = 0,
     Directory = 1,
@@ -35,6 +36,18 @@ pub enum Page<'a> {
     BPlusLeaf(BPlusLeaf<'a>),
 }
 
+impl<'a> Page<'a> {
+    pub fn raw(&self) -> &PageBuf {
+        match self {
+            Page::Directory(page) => page.raw(),
+            Page::SlottedData(page) => page.raw(),
+            Page::BPlusInner(page) => page.raw(),
+            Page::BPlusLeaf(page) => page.raw(),
+            Page::Invalid() => panic!("Cannot get raw() from Page::Invalid"),
+        }
+    }
+}
+
 pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
     // MAGIC: ensure that these values match the assigned PageKind values (#anchor-pagekind-values)
     match buf[0] {
@@ -49,6 +62,6 @@ pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
 /// initializes the raw buf_page
 /// zeros out all the values except the pagekind
 pub fn init_page_buf(buf: &mut PageBuf, kind: PageKind) {
+    buf.fill(0);
     buf[0] = kind as u8;
-    buf[1..64].fill(0);
 }

@@ -96,16 +96,14 @@ impl<'a> BPlusInner<'a> {
     pub fn init(&mut self, page_id: base::PageId, level: u16) {
         self.set_page_kind(base::PageKind::BPlusInner);
         self.set_level(level);
-        // Free space is page size - header - first_child_id
         self.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
         self.set_page_id(page_id);
         self.set_prev_sibling(None);
         self.set_next_sibling(None);
-        self.set_curr_vec_sz(0); // 0 keys
+        self.set_curr_vec_sz(0);
         self.set_key_size(0);
-        self.raw[3] = 0; // Reserved byte
-        self.raw[40..Self::HEADER_END].fill(0); // Reserved section
-        // Init first child id to 0 (invalid)
+        self.raw[3] = 0;
+        self.raw[40..Self::HEADER_END].fill(0);
         self.raw[Self::FIRST_CHILD_ID_START..Self::FIRST_CHILD_ID_END].fill(0);
     }
 
@@ -382,28 +380,28 @@ impl<'a> BPlusInner<'a> {
         self.get_child_at(child_index)
     }
 
-    // Remove a key and its associated child pointer (if found)
-    pub fn remove_key(&mut self, key: &[u8]) -> bool {
-        let key_size = self.get_key_size() as usize;
+    /// Removes a key at `key_index` AND its corresponding child pointer (at `key_index + 1`).
+    /// This is used when merging two nodes.
+    pub fn remove_entry_at(&mut self, key_index: usize) -> Vec<u8> {
         let curr_size = self.curr_vec_sz() as usize;
+        let entry_size = self.entry_size();
 
-        if let Some(pos) = self.find_key_position(key) {
-            let entry_size = self.entry_size();
+        // Get the key we are removing
+        let key_to_remove = self.get_key_at(key_index).to_vec();
 
-            if pos < curr_size - 1 {
-                let offset = Self::DATA_START + pos * entry_size;
-                let move_len = (curr_size - pos - 1) * entry_size;
-                self.raw
-                    .copy_within(offset + entry_size..offset + entry_size + move_len, offset);
-            }
-
-            // Update metadata
-            self.set_curr_vec_sz((curr_size - 1) as u32);
-            self.set_free_space(self.free_space() + (entry_size as u32));
-            true
-        } else {
-            false
+        // Shift all entries *after* this one left
+        if key_index < curr_size - 1 {
+            let offset = Self::DATA_START + key_index * entry_size;
+            let move_len = (curr_size - key_index - 1) * entry_size;
+            self.raw
+                .copy_within(offset + entry_size..offset + entry_size + move_len, offset);
         }
+
+        // Update metadata
+        self.set_curr_vec_sz((curr_size - 1) as u32);
+        self.set_free_space(self.free_space() + entry_size as u32);
+
+        key_to_remove
     }
 
     // Find key's position, return None if not found
@@ -485,7 +483,7 @@ impl<'a> BPlusInner<'a> {
         // Now, update the target node
         let target_old_first_child = target.get_child_at(0).unwrap();
 
-        // The target's *new* first key will be the separator_key from the parent
+        // The target's new first key will be the separator_key from the parent
         // The child associated with this new key will be the target_old_first_child
         target.insert_at_beginning(separator_key, target_old_first_child);
 
@@ -531,8 +529,8 @@ impl<'a> BPlusInner<'a> {
         self.set_curr_vec_sz((curr_size - 1) as u32);
         self.set_free_space(self.free_space() + entry_size as u32);
 
-        // Return the key that was removed, which becomes the new separator
-        first_key
+        // Return this node's new first key
+        self.get_key_at(0).to_vec()
     }
 
     /// Insert a key-child_id pair at the beginning of the node's entries.
@@ -579,5 +577,28 @@ impl<'a> BPlusInner<'a> {
         other_node.set_curr_vec_sz(0);
         other_node.set_free_space((constants::storage::PAGE_SIZE - Self::DATA_START) as u32);
         self.set_next_sibling(other_node.next_sibling());
+    }
+
+    pub fn populate_entries(&mut self, keys: &[Vec<u8>], children: &[base::PageId]) {
+        assert_eq!(
+            keys.len(),
+            children.len(),
+            "Keys and children arrays must have the same length"
+        );
+
+        let num_entries = keys.len();
+
+        self.raw[Self::DATA_START..].fill(0);
+
+        for i in 0..num_entries {
+            self.set_entry(i, &keys[i], children[i]);
+        }
+
+        self.set_curr_vec_sz(num_entries as u32);
+        let used_space = num_entries * self.entry_size();
+        self.set_free_space(
+            (constants::storage::PAGE_SIZE as u32 - Self::DATA_START as u32)
+                .saturating_sub(used_space as u32),
+        );
     }
 }

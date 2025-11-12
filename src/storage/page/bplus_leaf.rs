@@ -102,6 +102,7 @@ impl<'a> BPlusLeaf<'a> {
         self.set_key_size(0);
         self.raw[3] = 0; // Reserved byte
         self.raw[40..Self::DATA_START].fill(0); // Reserved section
+        self.raw[Self::DATA_START..].fill(0);
     }
 
     pub const fn page_kind(&self) -> u8 {
@@ -462,17 +463,13 @@ impl<'a> BPlusLeaf<'a> {
     /// Returns the key that was moved.
     pub fn move_last_to_beginning_of(&mut self, target: &mut BPlusLeaf) -> Vec<u8> {
         let curr_size = self.curr_vec_sz() as usize;
-
         let last_key = self.get_key_at(curr_size - 1).to_vec();
         let last_value = self.get_value_at(curr_size - 1);
 
-        // Remove from this leaf
         self.remove_key(&last_key);
-
-        // Insert into target at the beginning
         target.insert_at_beginning(&last_key, last_value);
 
-        last_key
+        target.get_key_at(0).to_vec()
     }
 
     /// Move the first key-value pair to the end of the target leaf
@@ -481,13 +478,10 @@ impl<'a> BPlusLeaf<'a> {
         let first_key = self.get_key_at(0).to_vec();
         let first_value = self.get_value_at(0);
 
-        // Remove from this leaf first
+        target.insert_sorted(&first_key, first_value);
         self.remove_key(&first_key);
 
-        // Insert into target at the end (insert_sorted handles this)
-        target.insert_sorted(&first_key, first_value);
-
-        // Return the new first key of this leaf
+        // Return this node's new first key
         self.get_key_at(0).to_vec()
     }
 
