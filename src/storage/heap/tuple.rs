@@ -22,12 +22,33 @@ impl Tuple {
         for (i, attr) in schema.attributes.iter().enumerate() {
             let val = &self.values[i];
             match (val, &attr.kind) {
-                (AttributeValue::I8(v), AttributeKind::I8) => {
+                // --- Unsigned Integers ---
+                (AttributeValue::U8(v), AttributeKind::U8) => buffer.push(*v),
+                (AttributeValue::U16(v), AttributeKind::U16) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::U32(v), AttributeKind::U32) => {
                     buffer.extend_from_slice(&v.to_be_bytes())
                 }
                 (AttributeValue::U64(v), AttributeKind::U64) => {
                     buffer.extend_from_slice(&v.to_be_bytes())
                 }
+
+                // --- Signed Integers ---
+                (AttributeValue::I8(v), AttributeKind::I8) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::I16(v), AttributeKind::I16) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::I32(v), AttributeKind::I32) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::I64(v), AttributeKind::I64) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+
+                // --- Floats & Bools ---
                 (AttributeValue::F64(v), AttributeKind::F64) => {
                     buffer.extend_from_slice(&v.to_be_bytes())
                 }
@@ -35,30 +56,25 @@ impl Tuple {
                     buffer.push(if *v { 1 } else { 0 })
                 }
 
-                // Fixed Char: Pad or Truncate
+                // --- Strings ---
                 (AttributeValue::Char(s), AttributeKind::Char(len)) => {
                     let bytes = s.as_bytes();
                     if bytes.len() > *len {
                         return Err(format!("Char too long: {} > {}", bytes.len(), len));
                     }
-                    buffer.push(bytes.len() as u8); // Length Prefix (1 byte)
+                    buffer.push(bytes.len() as u8);
                     buffer.extend_from_slice(bytes);
-                    // Padding
                     for _ in 0..(*len - bytes.len()) {
                         buffer.push(0);
                     }
                 }
-
-                // Variable Varchar: No Padding!
                 (AttributeValue::Varchar(s), AttributeKind::Varchar) => {
                     let bytes = s.as_bytes();
                     let len = bytes.len();
                     if len > u16::MAX as usize {
                         return Err("Varchar too long for u16 length prefix".to_string());
                     }
-                    // Write Length (2 bytes for Varchar to allow longer strings)
                     buffer.extend_from_slice(&(len as u16).to_be_bytes());
-                    // Write Data
                     buffer.extend_from_slice(bytes);
                 }
 
@@ -69,21 +85,37 @@ impl Tuple {
         Ok(buffer)
     }
 
-    /// Deserializes packed bytes into a Tuple.
     pub fn from_bytes(data: &[u8], schema: &TableType) -> Result<Self, String> {
         let mut values = Vec::new();
         let mut cursor = 0;
 
         for attr in &schema.attributes {
             if cursor >= data.len() {
+                // Only Varchar/Char might legitimately be empty if checks weren't strict,
+                // but generally this means truncated data.
                 return Err("Unexpected end of tuple data".to_string());
             }
 
             let val = match attr.kind {
-                AttributeKind::I8 => {
-                    let v = i8::from_be_bytes([data[cursor]]);
+                // --- Unsigned Integers ---
+                AttributeKind::U8 => {
+                    let v = data[cursor];
                     cursor += 1;
-                    AttributeValue::I8(v)
+                    AttributeValue::U8(v)
+                }
+                AttributeKind::U16 => {
+                    let bytes = data[cursor..cursor + 2]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 2;
+                    AttributeValue::U16(u16::from_be_bytes(bytes))
+                }
+                AttributeKind::U32 => {
+                    let bytes = data[cursor..cursor + 4]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 4;
+                    AttributeValue::U32(u32::from_be_bytes(bytes))
                 }
                 AttributeKind::U64 => {
                     let bytes = data[cursor..cursor + 8]
@@ -92,6 +124,36 @@ impl Tuple {
                     cursor += 8;
                     AttributeValue::U64(u64::from_be_bytes(bytes))
                 }
+
+                // --- Signed Integers ---
+                AttributeKind::I8 => {
+                    let v = i8::from_be_bytes([data[cursor]]);
+                    cursor += 1;
+                    AttributeValue::I8(v)
+                }
+                AttributeKind::I16 => {
+                    let bytes = data[cursor..cursor + 2]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 2;
+                    AttributeValue::I16(i16::from_be_bytes(bytes))
+                }
+                AttributeKind::I32 => {
+                    let bytes = data[cursor..cursor + 4]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 4;
+                    AttributeValue::I32(i32::from_be_bytes(bytes))
+                }
+                AttributeKind::I64 => {
+                    let bytes = data[cursor..cursor + 8]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 8;
+                    AttributeValue::I64(i64::from_be_bytes(bytes))
+                }
+
+                // --- Floats & Bools ---
                 AttributeKind::F64 => {
                     let bytes = data[cursor..cursor + 8]
                         .try_into()
@@ -104,16 +166,17 @@ impl Tuple {
                     cursor += 1;
                     AttributeValue::Bool(v)
                 }
+
+                // --- Strings ---
                 AttributeKind::Char(len) => {
-                    let str_len = data[cursor] as usize; // Read 1 byte len
+                    let str_len = data[cursor] as usize;
                     cursor += 1;
                     let s = String::from_utf8(data[cursor..cursor + str_len].to_vec())
                         .map_err(|_| "Invalid UTF8")?;
-                    cursor += len; // Skip full fixed width (data + padding)
+                    cursor += len;
                     AttributeValue::Char(s)
                 }
                 AttributeKind::Varchar => {
-                    // Read 2 byte length
                     let len_bytes = data[cursor..cursor + 2]
                         .try_into()
                         .map_err(|_| "Read err")?;

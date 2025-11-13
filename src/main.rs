@@ -1,3 +1,4 @@
+mod catalog;
 mod constants;
 mod rt_type;
 mod storage;

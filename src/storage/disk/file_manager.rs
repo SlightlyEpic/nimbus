@@ -11,8 +11,6 @@ pub struct FileManager {
 
 impl FileManager {
     pub fn new(file_path: String) -> io::Result<Self> {
-
-
         if cfg!(windows) {
             panic!("Non UNIX systems are not supported");
         }
@@ -28,6 +26,7 @@ impl FileManager {
     }
 
     /// buf: Should be a PageBuf slice
+    /// offset: Page Index (NOT byte offset)
     pub unsafe fn read_block_into(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let byte_offset = offset * constants::storage::PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(byte_offset))?;
@@ -37,6 +36,7 @@ impl FileManager {
     }
 
     /// buf: Should be a PageBuf slice
+    /// offset: Page Index (NOT byte offset)
     pub fn write_block_from(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
         let byte_offset = offset * constants::storage::PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(byte_offset))?;
@@ -48,16 +48,16 @@ impl FileManager {
 
     // adds a new page to the file
     pub fn allocate_new_page_offset(&mut self) -> io::Result<u64> {
-        // go to the end of the file hence it will be the offset
+        // go to the end of the file
         let current_size = self.file.seek(SeekFrom::End(0))?;
 
         // calculate the size to be allocated
         let target_size = current_size + constants::storage::PAGE_SIZE as u64;
 
         // append to the target size
-        // WARNING TOFIX: can truncate the file if too large
         self.file.set_len(target_size)?;
 
-        Ok(current_size)
+        // FIX: Return Page Index (Bytes / PageSize), NOT raw Bytes
+        Ok(current_size / constants::storage::PAGE_SIZE as u64)
     }
 }
