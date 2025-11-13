@@ -542,8 +542,6 @@ impl Catalog {
         let mut rows_to_index = Vec::new();
 
         {
-            let mut bp_guard = self.bp.lock().map_err(|_| "Lock")?;
-            let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
             let mut heap_iter = HeapIterator::new(pinned_bp.as_mut(), table_root);
 
             while let Some(Ok((rid, bytes))) = heap_iter.next() {
@@ -564,8 +562,6 @@ impl Catalog {
         }
 
         {
-            let mut bp_guard = self.bp.lock().map_err(|_| "Lock")?;
-            let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
             let mut tree = BPlusTree::new(pinned_bp.as_mut(), root_page_id);
 
             for (key, val) in rows_to_index {
@@ -582,7 +578,7 @@ impl Catalog {
         table_oid: u32,
         tuple: &Tuple,
         schema: &TableType,
-        mut bpm: Pin<&mut BufferPool>, // FIX: Removed 'mut' (warn(unused_mut))
+        mut bpm: Pin<&mut BufferPool>,
     ) -> Result<(), String> {
         let start_page = if table_oid == SYSTEM_TABLES_ID {
             SYSTEM_TABLES_PAGE_ID
@@ -599,8 +595,6 @@ impl Catalog {
 
         let mut heap = HeapFile::new(start_page, start_page);
         let bytes = tuple.to_bytes(schema)?;
-        // let mut bp_guard = self.bp.lock().map_err(|_| "Lock")?; // This deadlocks
-        // let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) }; // Use passed 'bpm'
 
         // 1. Insert into Heap
         let rid = heap
@@ -640,21 +634,41 @@ impl Catalog {
         rid: crate::storage::heap::row::RowId,
         mut bpm: Pin<&mut BufferPool>,
     ) -> Result<(), String> {
-        // 1. Find the table root page (to know which file/chain, though RowId has page_id)
-        if !self.root_page_cache.contains_key(&table_oid) {
-            return Err("Table not found".to_string());
-        }
+        // 1. Fetch tuple to get keys for index deletion
+        let tuple_bytes = HeapFile::get(bpm.as_mut(), rid)
+            .map_err(|e| format!("Failed to fetch tuple for delete: {:?}", e))?;
+
+        let schema = self.get_table_schema(table_oid).ok_or("Schema not found")?;
+        let tuple = Tuple::from_bytes(&tuple_bytes, &schema)?;
 
         // 2. Delete from Heap
         let mut heap = HeapFile::new(0, 0);
-
-        // let mut bp_guard = self.bp.lock().map_err(|_| "Lock poisoned")?; // This deadlocks
-        // let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) }; // Use passed 'bpm'
-
         heap.delete(bpm.as_mut(), rid)
             .map_err(|e| format!("Heap delete failed: {:?}", e))?;
 
-        // TODO: Delete from Indexes (BPlusTree::remove is not implemented yet)
+        // 3. Delete from Indexes
+        if let Some(indexes) = self.table_indexes.get(&table_oid) {
+            for &index_oid in indexes {
+                if let Some(meta) = self.index_meta_cache.get(&index_oid) {
+                    if meta.column_idx < tuple.values.len() {
+                        let key_val = &tuple.values[meta.column_idx];
+                        let key_bytes = match key_val {
+                            AttributeValue::U32(v) => v.to_be_bytes().to_vec(),
+                            AttributeValue::I32(v) => v.to_be_bytes().to_vec(),
+                            AttributeValue::U64(v) => v.to_be_bytes().to_vec(),
+                            AttributeValue::I64(v) => v.to_be_bytes().to_vec(),
+                            _ => continue,
+                        };
+
+                        if !key_bytes.is_empty() {
+                            let mut tree = BPlusTree::new(bpm.as_mut(), meta.root_page_id);
+                            // Ignore error if key not found (idempotent)
+                            let _ = tree.delete(&key_bytes);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

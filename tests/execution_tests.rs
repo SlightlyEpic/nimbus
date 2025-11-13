@@ -1,7 +1,9 @@
 use nimbus::catalog::manager::Catalog;
 use nimbus::catalog::schema::SYSTEM_TABLES_ID;
+use nimbus::execution::delete::DeleteExecutor;
 use nimbus::execution::executor::Executor;
 use nimbus::execution::filter::FilterExecutor;
+use nimbus::execution::index_scan::IndexScanExecutor;
 use nimbus::execution::insert::InsertExecutor;
 use nimbus::execution::projection::ProjectionExecutor;
 use nimbus::execution::seq_scan::SeqScanExecutor;
@@ -10,8 +12,6 @@ use nimbus::execution::values::ValuesExecutor;
 use nimbus::rt_type::primitives::{
     AttributeKind, AttributeValue, TableAttribute, TableLayout, TableType,
 };
-
-use nimbus::execution::index_scan::IndexScanExecutor;
 use nimbus::storage::buffer::BufferPool;
 use nimbus::storage::buffer::fifo_evictor::FifoEvictor;
 use nimbus::storage::disk::FileManager;
@@ -384,4 +384,89 @@ fn test_update_execution() {
         .next(pinned_bp.as_mut())
         .expect("Should find updated row"); // Pass bpm
     assert_eq!(updated_tuple.values[1], AttributeValue::U32(200));
+}
+
+#[test]
+fn test_delete_updates_index() {
+    let (bp, mut catalog) = setup_catalog("test_delete_idx.db");
+
+    // 1. Create Table
+    let schema = TableType {
+        attributes: vec![
+            TableAttribute {
+                name: "id".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "data".into(),
+                kind: AttributeKind::U64,
+                nullable: false,
+                is_internal: false,
+            },
+        ],
+        layout: TableLayout {
+            size: 0,
+            attr_layouts: vec![],
+        },
+    };
+    let table_oid = catalog.create_table("items", schema.clone()).unwrap();
+
+    // 2. Create Index on 'id'
+    let idx_oid = catalog.create_index("idx_id", "items", "id").unwrap();
+
+    // 3. Insert Tuple (1, 100)
+    let tuple = Tuple::new(vec![AttributeValue::U32(1), AttributeValue::U64(100)]);
+    let values_exec = Box::new(ValuesExecutor::new(vec![tuple]));
+
+    let mut bp_guard = bp.lock().unwrap();
+    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap();
+    insert_exec.init();
+    insert_exec.next(pinned_bp.as_mut());
+
+    // 4. Verify Insert: Index Scan for id=1 should return data
+    let key_bytes = 1u32.to_be_bytes().to_vec();
+    let mut idx_scan = IndexScanExecutor::new(&catalog, idx_oid, key_bytes.clone()).unwrap();
+    idx_scan.init();
+    let res = idx_scan.next(pinned_bp.as_mut());
+    assert!(res.is_some(), "Index scan should find inserted tuple");
+
+    // 5. DELETE WHERE id = 1
+    // We use a SeqScan to find the tuple to delete, feeding into DeleteExecutor
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap());
+    let filter_exec = Box::new(FilterExecutor::new(scan_exec, |t: &Tuple| {
+        if let AttributeValue::U32(id) = t.values[0] {
+            id == 1
+        } else {
+            false
+        }
+    }));
+
+    let mut delete_exec = DeleteExecutor::new(filter_exec, &catalog, table_oid);
+    delete_exec.init();
+    let del_res = delete_exec
+        .next(pinned_bp.as_mut())
+        .expect("Delete should return count");
+
+    if let AttributeValue::U32(count) = del_res.values[0] {
+        assert_eq!(count, 1, "Should delete 1 row");
+    }
+
+    // 6. Verify Delete: Index Scan for id=1 should NOW return None
+    let mut idx_scan_check = IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap();
+    idx_scan_check.init();
+    let res_check = idx_scan_check.next(pinned_bp.as_mut());
+    assert!(
+        res_check.is_none(),
+        "Index scan should NOT find deleted tuple"
+    );
+
+    // 7. Verify Heap Scan also returns empty
+    let mut seq_scan = SeqScanExecutor::new(&catalog, table_oid).unwrap();
+    seq_scan.init();
+    let seq_res = seq_scan.next(pinned_bp.as_mut());
+    assert!(seq_res.is_none(), "Seq scan should not find deleted tuple");
 }

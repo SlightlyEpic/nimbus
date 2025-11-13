@@ -195,6 +195,34 @@ impl<'a> BPlusInner<'a> {
         self.free_space() >= (self.entry_size() as u32)
     }
 
+    /// Returns the key associated with the child index (separator key).
+    /// For child 0, there is no key, so this returns None.
+    /// For child i > 0, it corresponds to key at i-1.
+    pub fn key_at_child_index(&self, child_idx: usize) -> Option<Vec<u8>> {
+        if child_idx == 0 {
+            None
+        } else {
+            Some(self.get_key_at(child_idx - 1).to_vec())
+        }
+    }
+
+    /// Finds the index of a specific child PageId.
+    pub fn lookup_child_index(&self, child_id: base::PageId) -> Option<usize> {
+        let num_keys = self.num_entries() as usize;
+        // Check first child
+        if self.get_child_at(0) == Some(child_id) {
+            return Some(0);
+        }
+        // Check rest
+        for i in 0..num_keys {
+            let id = self.get_child_id_at_entry(i);
+            if id == child_id {
+                return Some(i + 1);
+            }
+        }
+        None
+    }
+
     /// Get child at logical index (0 to num_entries inclusive)
     pub fn get_child_at(&self, index: usize) -> Option<base::PageId> {
         let num_keys = self.num_entries() as usize;
@@ -294,7 +322,7 @@ impl<'a> BPlusInner<'a> {
     ) -> BPlusInnerSplitData {
         let curr_sz = self.num_entries() as usize;
         let total_keys = curr_sz + 1;
-        let split_point = (total_keys + 1) / 2; // Split point is an index in the key array
+        let split_point = (total_keys + 1) / 2;
 
         let mut all_keys = Vec::with_capacity(total_keys);
         let mut all_children = Vec::with_capacity(total_keys + 1);
@@ -333,14 +361,11 @@ impl<'a> BPlusInner<'a> {
 
         // Get entries for the new (right) page
         let new_page_keys = all_keys[split_point..].to_vec();
-        // The *first* child of the new page is the *last* child of the old list
         let new_page_children = all_children[split_point + 1..].to_vec();
 
         // The first child of the new page is special
         let new_page_first_child = all_children[split_point];
 
-        // This is a bit of a hack: we return the first child separately
-        // and the BplusTree::insert_internal will handle it
         let mut children_for_data = vec![new_page_first_child];
         children_for_data.extend(new_page_children);
 
