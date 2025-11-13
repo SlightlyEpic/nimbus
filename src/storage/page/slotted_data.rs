@@ -41,7 +41,7 @@ impl<'a> SlottedData<'a> {
     // ---------+-----------+-----------+-----------+-----------|
     // 4095     | (End of Page)                                 |
     // ---------------------------------------------------------|
-    const SLOT_META_SIZE: usize = 4; // u16 offset + u16 len
+    pub const SLOT_META_SIZE: usize = 4; // u16 offset + u16 len
 
     /// Creates a new SlottedData page view from a raw buffer.
     pub fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
