@@ -1,0 +1,459 @@
+use crate::rt_type::primitives::{AttributeKind, AttributeValue, TableType};
+use std::convert::TryInto;
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Tuple {
+    pub values: Vec<AttributeValue>,
+}
+
+impl Tuple {
+    pub fn new(values: Vec<AttributeValue>) -> Self {
+        Self { values }
+    }
+
+    /// Serializes the tuple into a packed byte vector (Variable Length).
+    pub fn to_bytes(&self, schema: &TableType) -> Result<Vec<u8>, String> {
+        let mut buffer = Vec::new();
+
+        if self.values.len() != schema.attributes.len() {
+            return Err("Tuple values count does not match schema".to_string());
+        }
+
+        for (i, attr) in schema.attributes.iter().enumerate() {
+            let val = &self.values[i];
+            match (val, &attr.kind) {
+                (AttributeValue::I8(v), AttributeKind::I8) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::U64(v), AttributeKind::U64) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::F64(v), AttributeKind::F64) => {
+                    buffer.extend_from_slice(&v.to_be_bytes())
+                }
+                (AttributeValue::Bool(v), AttributeKind::Bool) => {
+                    buffer.push(if *v { 1 } else { 0 })
+                }
+
+                // Fixed Char: Pad or Truncate
+                (AttributeValue::Char(s), AttributeKind::Char(len)) => {
+                    let bytes = s.as_bytes();
+                    if bytes.len() > *len {
+                        return Err(format!("Char too long: {} > {}", bytes.len(), len));
+                    }
+                    buffer.push(bytes.len() as u8); // Length Prefix (1 byte)
+                    buffer.extend_from_slice(bytes);
+                    // Padding
+                    for _ in 0..(*len - bytes.len()) {
+                        buffer.push(0);
+                    }
+                }
+
+                // Variable Varchar: No Padding!
+                (AttributeValue::Varchar(s), AttributeKind::Varchar) => {
+                    let bytes = s.as_bytes();
+                    let len = bytes.len();
+                    if len > u16::MAX as usize {
+                        return Err("Varchar too long for u16 length prefix".to_string());
+                    }
+                    // Write Length (2 bytes for Varchar to allow longer strings)
+                    buffer.extend_from_slice(&(len as u16).to_be_bytes());
+                    // Write Data
+                    buffer.extend_from_slice(bytes);
+                }
+
+                _ => return Err(format!("Type mismatch for col {}", attr.name)),
+            }
+        }
+
+        Ok(buffer)
+    }
+
+    /// Deserializes packed bytes into a Tuple.
+    pub fn from_bytes(data: &[u8], schema: &TableType) -> Result<Self, String> {
+        let mut values = Vec::new();
+        let mut cursor = 0;
+
+        for attr in &schema.attributes {
+            if cursor >= data.len() {
+                return Err("Unexpected end of tuple data".to_string());
+            }
+
+            let val = match attr.kind {
+                AttributeKind::I8 => {
+                    let v = i8::from_be_bytes([data[cursor]]);
+                    cursor += 1;
+                    AttributeValue::I8(v)
+                }
+                AttributeKind::U64 => {
+                    let bytes = data[cursor..cursor + 8]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 8;
+                    AttributeValue::U64(u64::from_be_bytes(bytes))
+                }
+                AttributeKind::F64 => {
+                    let bytes = data[cursor..cursor + 8]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    cursor += 8;
+                    AttributeValue::F64(f64::from_be_bytes(bytes))
+                }
+                AttributeKind::Bool => {
+                    let v = data[cursor] != 0;
+                    cursor += 1;
+                    AttributeValue::Bool(v)
+                }
+                AttributeKind::Char(len) => {
+                    let str_len = data[cursor] as usize; // Read 1 byte len
+                    cursor += 1;
+                    let s = String::from_utf8(data[cursor..cursor + str_len].to_vec())
+                        .map_err(|_| "Invalid UTF8")?;
+                    cursor += len; // Skip full fixed width (data + padding)
+                    AttributeValue::Char(s)
+                }
+                AttributeKind::Varchar => {
+                    // Read 2 byte length
+                    let len_bytes = data[cursor..cursor + 2]
+                        .try_into()
+                        .map_err(|_| "Read err")?;
+                    let str_len = u16::from_be_bytes(len_bytes) as usize;
+                    cursor += 2;
+
+                    let s = String::from_utf8(data[cursor..cursor + str_len].to_vec())
+                        .map_err(|_| "Invalid UTF8")?;
+                    cursor += str_len;
+                    AttributeValue::Varchar(s)
+                }
+                _ => return Err("Unsupported type deserialization".to_string()),
+            };
+            values.push(val);
+        }
+
+        Ok(Self { values })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rt_type::primitives::{
+        AttributeKind, AttributeValue, LayoutAttrData, TableAttribute, TableLayout, TableType,
+    };
+    use crate::storage::buffer::BufferPool;
+    use crate::storage::buffer::fifo_evictor::FifoEvictor;
+    use crate::storage::disk::FileManager;
+    use crate::storage::heap::heap_file::HeapFile;
+    use crate::storage::page::base::PageKind;
+    use crate::storage::page_locator::locator::DirectoryPageLocator;
+    use std::fs;
+    use std::sync::atomic::AtomicU32;
+
+    // Helper to manually construct a schema without relying on the Builder
+    fn create_complex_schema() -> TableType {
+        let attrs = vec![
+            TableAttribute {
+                name: "tiny_int".to_string(),
+                kind: AttributeKind::I8,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "big_int".to_string(),
+                kind: AttributeKind::U64,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "float_val".to_string(),
+                kind: AttributeKind::F64,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "is_active".to_string(),
+                kind: AttributeKind::Bool,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "short_text".to_string(),
+                kind: AttributeKind::Char(10),
+                nullable: false,
+                is_internal: false,
+            },
+        ];
+
+        // Manual layout calculation (simplified packing)
+        // I8 (0) -> 1 byte
+        // Padding 7 bytes
+        // U64 (8) -> 8 bytes
+        // F64 (16) -> 8 bytes
+        // Bool (24) -> 1 byte
+        // Char(10) (25) -> 11 bytes (1 len + 10 data)
+        // End offset = 25 + 11 = 36.
+        // Round up to 8-byte alignment = 40.
+        TableType {
+            attributes: attrs,
+            layout: TableLayout {
+                size: 40, // FIX: Increased from 32 to 40
+                attr_layouts: vec![
+                    LayoutAttrData {
+                        attr_name: "tiny_int".to_string(),
+                        offset: 0,
+                    },
+                    LayoutAttrData {
+                        attr_name: "big_int".to_string(),
+                        offset: 8,
+                    }, // Aligned to 8
+                    LayoutAttrData {
+                        attr_name: "float_val".to_string(),
+                        offset: 16,
+                    },
+                    LayoutAttrData {
+                        attr_name: "is_active".to_string(),
+                        offset: 24,
+                    },
+                    LayoutAttrData {
+                        attr_name: "short_text".to_string(),
+                        offset: 25,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn test_tuple_all_types() {
+        let schema = create_complex_schema();
+
+        let original = Tuple::new(vec![
+            AttributeValue::I8(-120),
+            AttributeValue::U64(1234567890123456),
+            AttributeValue::F64(3.14159),
+            AttributeValue::Bool(true),
+            AttributeValue::Char("Testing".to_string()),
+        ]);
+
+        let bytes = original.to_bytes(&schema).expect("Serialization failed");
+        let deserialized = Tuple::from_bytes(&bytes, &schema).expect("Deserialization failed");
+
+        // Verify specific values to ensure types retained accuracy
+        match &deserialized.values[0] {
+            AttributeValue::I8(v) => assert_eq!(*v, -120),
+            _ => panic!("Wrong type I8"),
+        }
+        match &deserialized.values[1] {
+            AttributeValue::U64(v) => assert_eq!(*v, 1234567890123456),
+            _ => panic!("Wrong type U64"),
+        }
+        match &deserialized.values[2] {
+            AttributeValue::F64(v) => assert!((v - 3.14159).abs() < f64::EPSILON),
+            _ => panic!("Wrong type F64"),
+        }
+        match &deserialized.values[3] {
+            AttributeValue::Bool(v) => assert_eq!(*v, true),
+            _ => panic!("Wrong type Bool"),
+        }
+        match &deserialized.values[4] {
+            AttributeValue::Char(v) => assert_eq!(v, "Testing"),
+            _ => panic!("Wrong type Char"),
+        }
+    }
+
+    #[test]
+    fn test_string_boundaries() {
+        // Schema with Char(5). Size = 5 + 1 = 6.
+        let schema = TableType {
+            attributes: vec![TableAttribute {
+                name: "text".to_string(),
+                kind: AttributeKind::Char(5),
+                nullable: false,
+                is_internal: false,
+            }],
+            layout: TableLayout {
+                size: 6, // 1 byte len + 5 bytes data
+                attr_layouts: vec![LayoutAttrData {
+                    attr_name: "text".to_string(),
+                    offset: 0,
+                }],
+            },
+        };
+
+        // Case 1: Empty String
+        let t1 = Tuple::new(vec![AttributeValue::Char("".to_string())]);
+        let b1 = t1.to_bytes(&schema).unwrap();
+        let d1 = Tuple::from_bytes(&b1, &schema).unwrap();
+        if let AttributeValue::Char(s) = &d1.values[0] {
+            assert_eq!(s, "");
+        } else {
+            panic!();
+        }
+
+        // Case 2: Max Length String (5 chars)
+        let t2 = Tuple::new(vec![AttributeValue::Char("12345".to_string())]);
+        let b2 = t2.to_bytes(&schema).unwrap();
+        let d2 = Tuple::from_bytes(&b2, &schema).unwrap();
+        if let AttributeValue::Char(s) = &d2.values[0] {
+            assert_eq!(s, "12345");
+        } else {
+            panic!();
+        }
+
+        // Case 3: String too long (Should fail)
+        let t3 = Tuple::new(vec![AttributeValue::Char("123456".to_string())]);
+        assert!(t3.to_bytes(&schema).is_err());
+    }
+
+    #[test]
+    fn test_schema_validation() {
+        let schema = create_complex_schema(); // Expects 5 cols
+
+        // Case 1: Too few columns
+        let t1 = Tuple::new(vec![AttributeValue::I8(1)]);
+        assert!(t1.to_bytes(&schema).is_err());
+
+        // Case 2: Too many columns
+        let t2 = Tuple::new(vec![
+            AttributeValue::I8(1),
+            AttributeValue::U64(1),
+            AttributeValue::F64(1.0),
+            AttributeValue::Bool(true),
+            AttributeValue::Char("A".to_string()),
+            AttributeValue::Bool(false), // Extra
+        ]);
+        assert!(t2.to_bytes(&schema).is_err());
+    }
+
+    #[test]
+    fn test_type_mismatch() {
+        let schema = TableType {
+            attributes: vec![TableAttribute {
+                name: "id".to_string(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            }],
+            // Layout is ignored in Packed Tuple logic, so empty is fine
+            layout: TableLayout {
+                size: 0,
+                attr_layouts: vec![],
+            },
+        };
+
+        // Pass a String where U32 is expected
+        let t1 = Tuple::new(vec![AttributeValue::Char("Bad".to_string())]);
+        let res = t1.to_bytes(&schema);
+
+        assert!(res.is_err());
+
+        // look for "Type mismatch"
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("Type mismatch"),
+            "Expected 'Type mismatch' error, got: '{}'",
+            err
+        );
+    }
+
+    #[test]
+    fn test_heap_file_integration_persistence() {
+        let test_file = "test_tuple_persist.db";
+        let _ = fs::remove_file(test_file);
+        let file_manager = FileManager::new(test_file.to_string()).unwrap();
+        let evictor = Box::new(FifoEvictor::new());
+        let locator = Box::new(DirectoryPageLocator::new());
+        let mut bp = Box::pin(BufferPool::new(file_manager, evictor, locator));
+
+        // Bootstrap directory
+        let frame = bp.as_mut().alloc_new_page(PageKind::Directory, 1).unwrap();
+        let fid = frame.fid();
+        bp.as_mut().unpin_frame(fid).unwrap();
+        let counter = AtomicU32::new(1);
+
+        let schema = create_complex_schema();
+        let t1 = Tuple::new(vec![
+            AttributeValue::I8(10),
+            AttributeValue::U64(9999),
+            AttributeValue::F64(1.23),
+            AttributeValue::Bool(false),
+            AttributeValue::Char("Persist".to_string()),
+        ]);
+
+        // Insert
+        let mut heap = HeapFile::new(0, 0);
+        let bytes = t1.to_bytes(&schema).unwrap();
+        let rid = heap
+            .insert(bp.as_mut(), &counter, &bytes)
+            .expect("Insert failed");
+
+        // Simulate restart (flush and re-read)
+        bp.as_mut().flush_all().unwrap();
+
+        let read_bytes = HeapFile::get(bp.as_mut(), rid).expect("Get failed");
+        let t2 = Tuple::from_bytes(&read_bytes, &schema).expect("Deserialize failed");
+
+        assert_eq!(t1, t2);
+
+        fs::remove_file(test_file).unwrap();
+    }
+
+    fn create_varchar_schema() -> TableType {
+        TableType {
+            attributes: vec![
+                TableAttribute {
+                    name: "id".into(),
+                    kind: AttributeKind::U64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                TableAttribute {
+                    name: "bio".into(),
+                    kind: AttributeKind::Varchar,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            layout: TableLayout {
+                size: 0,
+                attr_layouts: vec![],
+            }, // Layout is now dynamic/ignored
+        }
+    }
+
+    #[test]
+    fn test_varchar_space_saving() {
+        let schema = create_varchar_schema();
+
+        // Tuple 1: Short String (Bio: "Hi")
+        // Expected Size: 8 (U64) + 2 (Len) + 2 (Data) = 12 bytes
+        let t1 = Tuple::new(vec![
+            AttributeValue::U64(1),
+            AttributeValue::Varchar("Hi".to_string()),
+        ]);
+        let b1 = t1.to_bytes(&schema).unwrap();
+        assert_eq!(b1.len(), 12, "Short string should take exactly 12 bytes");
+
+        // Tuple 2: Long String (Bio: "Hello World")
+        // Expected Size: 8 (U64) + 2 (Len) + 11 (Data) = 21 bytes
+        let t2 = Tuple::new(vec![
+            AttributeValue::U64(2),
+            AttributeValue::Varchar("Hello World".to_string()),
+        ]);
+        let b2 = t2.to_bytes(&schema).unwrap();
+        assert_eq!(b2.len(), 21, "Longer string should take more bytes");
+
+        // Verify Deserialization works for both
+        let d1 = Tuple::from_bytes(&b1, &schema).unwrap();
+        let d2 = Tuple::from_bytes(&b2, &schema).unwrap();
+
+        match &d1.values[1] {
+            AttributeValue::Varchar(s) => assert_eq!(s, "Hi"),
+            _ => panic!("Wrong type"),
+        }
+        match &d2.values[1] {
+            AttributeValue::Varchar(s) => assert_eq!(s, "Hello World"),
+            _ => panic!("Wrong type"),
+        }
+    }
+}

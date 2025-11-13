@@ -2,6 +2,7 @@ use crate::{
     constants,
     rt_type::primitives::{self, AttributeKind, AttributeValue, TableAttribute},
 };
+use std::convert::TryInto;
 
 pub struct LayoutReadWriter<'a> {
     layout: &'a primitives::TableLayout,
@@ -33,11 +34,18 @@ impl<'a> LayoutReadWriter<'a> {
                 .ok_or(errors::ReadAttrError::BadSlice)?;
 
         let offset_us = offset as usize;
-        // Add bounds check
-        if offset_us + attr.kind.size_of() > buffer.len() {
+        let fixed_size = attr.kind.size_of();
+
+        if offset_us + fixed_size > buffer.len() {
             return Err(errors::ReadAttrError::BadSlice);
         }
-        let slice = &buffer[offset_us..offset_us + attr.kind.size_of()];
+
+        // We only create a slice for fixed types. Varchar must handle buffer directly.
+        let slice = if fixed_size > 0 {
+            &buffer[offset_us..offset_us + fixed_size]
+        } else {
+            &[] // Placeholder for Varchar
+        };
 
         match attr.kind {
             AttributeKind::U8 => Ok(AttributeValue::U8(u8::from_le_bytes(
@@ -108,13 +116,12 @@ impl<'a> LayoutReadWriter<'a> {
             }
             AttributeKind::Char(max_size) => {
                 if slice.is_empty() {
-                    return Err(errors::ReadAttrError::BadSlice); // no length byte
+                    return Err(errors::ReadAttrError::BadSlice);
                 }
                 let actual_len = slice[0] as usize;
                 if actual_len > max_size {
                     return Err(errors::ReadAttrError::BadStringValue);
                 }
-                // Safety check for buffer read
                 if slice.len() < 1 + actual_len {
                     return Err(errors::ReadAttrError::BadSlice);
                 }
@@ -125,14 +132,37 @@ impl<'a> LayoutReadWriter<'a> {
 
                 Ok(AttributeValue::Char(s.to_string()))
             }
+            AttributeKind::Varchar => {
+                // 1. Read Length (2 bytes, Big Endian preferred for network/disk standard, using BE here to match previous logic if any)
+                if offset_us + 2 > buffer.len() {
+                    return Err(errors::ReadAttrError::BadSlice);
+                }
+                let len_bytes: [u8; 2] = buffer[offset_us..offset_us + 2]
+                    .try_into()
+                    .map_err(|_| errors::ReadAttrError::BadSlice)?;
+
+                // Use Big Endian (be_bytes) for length often avoids confusion,
+                let str_len = u16::from_be_bytes(len_bytes) as usize;
+
+                // 2. Read Data
+                if offset_us + 2 + str_len > buffer.len() {
+                    return Err(errors::ReadAttrError::BadSlice);
+                }
+
+                let str_bytes = &buffer[offset_us + 2..offset_us + 2 + str_len];
+                let s = std::str::from_utf8(str_bytes)
+                    .map_err(|_| errors::ReadAttrError::BadStringValue)?;
+
+                Ok(AttributeValue::Varchar(s.to_string()))
+            }
         }
     }
 
     pub fn write_attr(
         &self,
         attr: &TableAttribute,
-        value: &AttributeValue, // Changed to reference for efficiency
-        buffer: &mut [u8],      // Changed from &mut [u8; PAGE_SIZE]
+        value: &AttributeValue,
+        buffer: &mut [u8],
         base_offset: u16,
     ) -> Result<(), errors::WriteAttrError> {
         let offset = base_offset
@@ -143,51 +173,49 @@ impl<'a> LayoutReadWriter<'a> {
         let offset_us = offset as usize;
         let size = attr.kind.size_of();
 
-        if offset_us + size > buffer.len() {
+        if size > 0 && offset_us + size > buffer.len() {
             return Err(errors::WriteAttrError::OffsetOutOfBounds);
         }
 
-        let buf = &mut buffer[offset_us..offset_us + size];
-
         match (attr.kind, value) {
             (AttributeKind::U8, AttributeValue::U8(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::U16, AttributeValue::U16(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::U32, AttributeValue::U32(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::U64, AttributeValue::U64(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::U128, AttributeValue::U128(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::I8, AttributeValue::I8(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::I16, AttributeValue::I16(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::I32, AttributeValue::I32(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::I64, AttributeValue::I64(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::I128, AttributeValue::I128(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::F32, AttributeValue::F32(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::F64, AttributeValue::F64(v)) => {
-                buf.copy_from_slice(&v.to_le_bytes());
+                buffer[offset_us..offset_us + size].copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::Bool, AttributeValue::Bool(v)) => {
-                buf[0] = if *v { 1 } else { 0 };
+                buffer[offset_us] = if *v { 1 } else { 0 };
             }
             (AttributeKind::Char(max_size), AttributeValue::Char(s)) => {
                 let bytes = s.as_bytes();
@@ -195,14 +223,31 @@ impl<'a> LayoutReadWriter<'a> {
                     return Err(errors::WriteAttrError::ValueKindMismatch);
                 }
 
-                buf[0] = bytes.len() as u8;
-                buf[1..1 + bytes.len()].copy_from_slice(bytes);
-
-                // zero-fill the rest
-                for b in &mut buf[1 + bytes.len()..] {
+                buffer[offset_us] = bytes.len() as u8;
+                buffer[offset_us + 1..offset_us + 1 + bytes.len()].copy_from_slice(bytes);
+                for b in &mut buffer[offset_us + 1 + bytes.len()..offset_us + size] {
                     *b = 0;
                 }
             }
+            (AttributeKind::Varchar, AttributeValue::Varchar(s)) => {
+                let bytes = s.as_bytes();
+                let len = bytes.len();
+                if len > u16::MAX as usize {
+                    return Err(errors::WriteAttrError::ValueKindMismatch);
+                }
+
+                // Check capacity (2 bytes len + data)
+                if offset_us + 2 + len > buffer.len() {
+                    return Err(errors::WriteAttrError::OffsetOutOfBounds);
+                }
+
+                // Write Length (Big Endian)
+                buffer[offset_us..offset_us + 2].copy_from_slice(&(len as u16).to_be_bytes());
+
+                // Write Data
+                buffer[offset_us + 2..offset_us + 2 + len].copy_from_slice(bytes);
+            }
+
             _ => return Err(errors::WriteAttrError::ValueKindMismatch),
         }
 

@@ -17,8 +17,10 @@ pub enum AttributeKind {
 
     Bool,
     Char(usize),
+    Varchar,
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum AttributeValue {
     U8(u8),
     U16(u16),
@@ -37,6 +39,7 @@ pub enum AttributeValue {
 
     Bool(bool),
     Char(String),
+    Varchar(String),
 }
 
 #[derive(Clone)]
@@ -81,7 +84,8 @@ impl AttributeKind {
             AttributeKind::F32 => 4,
             AttributeKind::F64 => 8,
             AttributeKind::Bool => 1,
-            AttributeKind::Char(size) => size,
+            AttributeKind::Char(size) => size + 1,
+            AttributeKind::Varchar => 0,
         }
     }
 
@@ -109,6 +113,47 @@ impl AttributeKind {
                 }
                 16
             }
+            AttributeKind::Varchar => 1,
+        }
+    }
+
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            AttributeKind::U8 => 1,
+            AttributeKind::U16 => 2,
+            AttributeKind::U32 => 3,
+            AttributeKind::U64 => 4,
+            AttributeKind::U128 => 5,
+            AttributeKind::I8 => 6,
+            AttributeKind::I16 => 7,
+            AttributeKind::I32 => 8,
+            AttributeKind::I64 => 9,
+            AttributeKind::I128 => 10,
+            AttributeKind::F32 => 11,
+            AttributeKind::F64 => 12,
+            AttributeKind::Bool => 13,
+            AttributeKind::Char(_) => 14,
+            AttributeKind::Varchar => 15,
+        }
+    }
+    pub fn from_u8(kind: u8, size: u16) -> Option<Self> {
+        match kind {
+            1 => Some(AttributeKind::U8),
+            2 => Some(AttributeKind::U16),
+            3 => Some(AttributeKind::U32),
+            4 => Some(AttributeKind::U64),
+            5 => Some(AttributeKind::U128),
+            6 => Some(AttributeKind::I8),
+            7 => Some(AttributeKind::I16),
+            8 => Some(AttributeKind::I32),
+            9 => Some(AttributeKind::I64),
+            10 => Some(AttributeKind::I128),
+            11 => Some(AttributeKind::F32),
+            12 => Some(AttributeKind::F64),
+            13 => Some(AttributeKind::Bool),
+            14 => Some(AttributeKind::Char(size as usize)),
+            15 => Some(AttributeKind::Varchar),
+            _ => None,
         }
     }
 }

@@ -22,6 +22,7 @@ impl primitives::AttributeKind {
             primitives::AttributeKind::F64 => 8,
             primitives::AttributeKind::Bool => 1,
             primitives::AttributeKind::Char(max_size) => max_size,
+            primitives::AttributeKind::Varchar => 0,
         }
     }
 }
