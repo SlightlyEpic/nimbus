@@ -13,14 +13,14 @@ use super::schema::{
     SYSTEM_COLUMNS_ID, SYSTEM_TABLES_ID, get_system_columns_schema, get_system_tables_schema,
 };
 
-// Fixed Page IDs for system tables
 const SYSTEM_TABLES_PAGE_ID: u32 = 1;
 const SYSTEM_COLUMNS_PAGE_ID: u32 = 2;
 
 pub struct Catalog {
     bp: Arc<Mutex<BufferPool>>,
-    table_cache: HashMap<String, u32>,
-    schema_cache: HashMap<u32, TableType>,
+    table_cache: HashMap<String, u32>,     // Name -> OID
+    root_page_cache: HashMap<u32, u32>,    // OID -> Root Page ID
+    schema_cache: HashMap<u32, TableType>, // OID -> Schema
     next_oid: AtomicU32,
 }
 
@@ -29,6 +29,7 @@ impl Catalog {
         let mut catalog = Self {
             bp,
             table_cache: HashMap::new(),
+            root_page_cache: HashMap::new(),
             schema_cache: HashMap::new(),
             next_oid: AtomicU32::new(100),
         };
@@ -38,10 +39,16 @@ impl Catalog {
     }
 
     fn init_system_tables(&mut self) {
+        // Register System Tables (Fixed IDs)
         self.table_cache
             .insert("system_tables".to_string(), SYSTEM_TABLES_ID);
         self.table_cache
             .insert("system_columns".to_string(), SYSTEM_COLUMNS_ID);
+
+        self.root_page_cache
+            .insert(SYSTEM_TABLES_ID, SYSTEM_TABLES_PAGE_ID);
+        self.root_page_cache
+            .insert(SYSTEM_COLUMNS_ID, SYSTEM_COLUMNS_PAGE_ID);
 
         self.schema_cache
             .insert(SYSTEM_TABLES_ID, get_system_tables_schema());
@@ -57,47 +64,41 @@ impl Catalog {
         let mut bp_guard = self.bp.lock().expect("Lock poisoned");
         let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-        // 1. Create Directory (Page 0)
         if pinned_bp.as_mut().fetch_page_at_offset(0).is_err() {
+            // 1. Directory
             pinned_bp
                 .as_mut()
                 .alloc_new_page(PageKind::Directory, 0)
-                .expect("Bootstrap: Failed to allocate root directory");
+                .expect("Bootstrap dir");
 
-            // 2. Create system_tables Root (Page 1)
+            // 2. System Tables Root
             let frame_tabs = pinned_bp
                 .as_mut()
                 .alloc_new_page(PageKind::SlottedData, SYSTEM_TABLES_PAGE_ID)
-                .expect("Bootstrap: Failed to alloc system_tables page");
-            let fid_tabs = frame_tabs.fid();
-            let offset_tabs = frame_tabs.file_offset();
-
-            // Manually register in directory
-            pinned_bp.as_mut().unpin_frame(fid_tabs).ok();
+                .expect("Bootstrap tabs");
+            let off_tabs = frame_tabs.file_offset();
+            let tabs_fid = frame_tabs.fid();
+            pinned_bp.as_mut().unpin_frame(tabs_fid).ok();
             pinned_bp
                 .as_mut()
-                .register_page_in_directory(SYSTEM_TABLES_PAGE_ID, offset_tabs, 4000)
+                .register_page_in_directory(SYSTEM_TABLES_PAGE_ID, off_tabs, 4000)
                 .unwrap();
 
-            // 3. Create system_columns Root (Page 2)
+            // 3. System Columns Root
             let frame_cols = pinned_bp
                 .as_mut()
                 .alloc_new_page(PageKind::SlottedData, SYSTEM_COLUMNS_PAGE_ID)
-                .expect("Bootstrap: Failed to alloc system_columns page");
-            let fid_cols = frame_cols.fid();
-            let offset_cols = frame_cols.file_offset();
+                .expect("Bootstrap cols");
+            let off_cols = frame_cols.file_offset();
 
-            pinned_bp.as_mut().unpin_frame(fid_cols).ok();
+            let cols_fid = frame_cols.fid();
+            pinned_bp.as_mut().unpin_frame(cols_fid).ok();
             pinned_bp
                 .as_mut()
-                .register_page_in_directory(SYSTEM_COLUMNS_PAGE_ID, offset_cols, 4000)
+                .register_page_in_directory(SYSTEM_COLUMNS_PAGE_ID, off_cols, 4000)
                 .unwrap();
 
-            // Flush all
-            pinned_bp
-                .as_mut()
-                .flush_all()
-                .expect("Bootstrap: Failed to flush");
+            pinned_bp.as_mut().flush_all().expect("Flush");
         }
     }
 
@@ -105,46 +106,51 @@ impl Catalog {
         let mut bp_guard = self.bp.lock().map_err(|_| "Lock poisoned")?;
         let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-        // Check DB init
         if pinned_bp.as_mut().fetch_page_at_offset(0).is_err() {
-            return Err("Database uninitialized".to_string());
+            return Err("Uninitialized".to_string());
         }
 
-        // --- Step A: Recover Tables (Start at Page 1) ---
+        // --- Load Tables ---
         let mut tables_iter = HeapIterator::new(pinned_bp.as_mut(), SYSTEM_TABLES_PAGE_ID);
         let mut max_oid = 99;
 
-        while let Some(tuple_bytes_res) = tables_iter.next() {
-            let tuple_bytes = tuple_bytes_res.map_err(|e| format!("Scan tables error: {:?}", e))?;
-            let tuple = Tuple::from_bytes(&tuple_bytes, &get_system_tables_schema())?;
+        while let Some(tuple_res) = tables_iter.next() {
+            let tuple = Tuple::from_bytes(
+                &tuple_res.map_err(|e| format!("{:?}", e))?,
+                &get_system_tables_schema(),
+            )?;
 
+            // Schema: [oid, name, root_page]
             let oid = match tuple.values.get(0) {
                 Some(AttributeValue::U32(v)) => *v,
-                _ => return Err("Corrupt system_tables".to_string()),
+                _ => return Err("Bad OID".into()),
             };
             let name = match tuple.values.get(1) {
                 Some(AttributeValue::Varchar(v)) => v.clone(),
-                _ => return Err("Corrupt system_tables".to_string()),
+                _ => return Err("Bad Name".into()),
+            };
+            let root = match tuple.values.get(2) {
+                Some(AttributeValue::U32(v)) => *v,
+                _ => return Err("Bad Root".into()),
             };
 
             self.table_cache.insert(name, oid);
+            self.root_page_cache.insert(oid, root);
             if oid > max_oid {
                 max_oid = oid;
             }
         }
         self.next_oid.store(max_oid + 1, Ordering::SeqCst);
 
-        // --- Step B: Recover Columns (Start at Page 2) ---
-        // Reset iterator for columns
+        // --- Load Columns ---
         let mut cols_iter = HeapIterator::new(pinned_bp.as_mut(), SYSTEM_COLUMNS_PAGE_ID);
         let mut table_attrs: HashMap<u32, Vec<TableAttribute>> = HashMap::new();
 
-        while let Some(tuple_bytes_res) = cols_iter.next() {
-            let tuple_bytes =
-                tuple_bytes_res.map_err(|e| format!("Scan columns error: {:?}", e))?;
-            let tuple = Tuple::from_bytes(&tuple_bytes, &get_system_columns_schema())?;
-
-            // Unpack: [table_oid, col_name, col_type, col_len]
+        while let Some(tuple_res) = cols_iter.next() {
+            let tuple = Tuple::from_bytes(
+                &tuple_res.map_err(|e| format!("{:?}", e))?,
+                &get_system_columns_schema(),
+            )?;
             let table_oid = match tuple.values.get(0) {
                 Some(AttributeValue::U32(v)) => *v,
                 _ => continue,
@@ -162,8 +168,7 @@ impl Catalog {
                 _ => continue,
             };
 
-            let kind = AttributeKind::from_u8(col_type, col_len).ok_or("Unknown type")?;
-
+            let kind = AttributeKind::from_u8(col_type, col_len).ok_or("Unknown kind")?;
             let attr = TableAttribute {
                 name: col_name,
                 kind,
@@ -183,8 +188,12 @@ impl Catalog {
             };
             self.schema_cache.insert(oid, schema);
         }
-
         Ok(())
+    }
+
+    // NEW: Public accessor for SeqScan
+    pub fn get_table_root_page(&self, oid: u32) -> Option<u32> {
+        self.root_page_cache.get(&oid).copied()
     }
 
     pub fn get_table_oid(&self, name: &str) -> Option<u32> {
@@ -201,17 +210,46 @@ impl Catalog {
         }
 
         let oid = self.next_oid.fetch_add(1, Ordering::SeqCst);
+
+        // 1. Allocate the Root Data Page for this table immediately
+        let root_page_id = {
+            let mut bp_guard = self.bp.lock().map_err(|_| "Lock poisoned")?;
+            let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+            let new_pid = self.next_oid.fetch_add(1, Ordering::SeqCst);
+
+            let frame = pinned_bp
+                .as_mut()
+                .alloc_new_page(PageKind::SlottedData, new_pid)
+                .map_err(|e| format!("Failed to alloc table root: {:?}", e))?;
+
+            // Register in directory
+            let offset = frame.file_offset();
+            let fid = frame.fid();
+            pinned_bp.as_mut().unpin_frame(fid).ok();
+            pinned_bp
+                .as_mut()
+                .register_page_in_directory(new_pid, offset, 4000)
+                .unwrap();
+
+            new_pid
+        };
+
+        // 2. Update Metadata
         self.table_cache.insert(name.to_string(), oid);
+        self.root_page_cache.insert(oid, root_page_id);
         self.schema_cache.insert(oid, schema.clone());
 
+        // 3. Insert into system_tables: [oid, name, root_page]
         let sys_tables_schema = get_system_tables_schema();
         let table_row = Tuple::new(vec![
             AttributeValue::U32(oid),
             AttributeValue::Varchar(name.to_string()),
+            AttributeValue::U32(root_page_id), // Storing the root
         ]);
-
         self.insert_tuple(SYSTEM_TABLES_ID, &table_row, &sys_tables_schema)?;
 
+        // 4. Insert columns
         let sys_cols_schema = get_system_columns_schema();
         for col in &schema.attributes {
             let max_len = match col.kind {
@@ -236,52 +274,28 @@ impl Catalog {
         tuple: &Tuple,
         schema: &TableType,
     ) -> Result<(), String> {
+        // Determine start page: Fixed for system tables, Dynamic (0) for user tables
         let start_page = if table_oid == SYSTEM_TABLES_ID {
             SYSTEM_TABLES_PAGE_ID
         } else if table_oid == SYSTEM_COLUMNS_ID {
             SYSTEM_COLUMNS_PAGE_ID
         } else {
-            0 // For user tables, dynamic
+            0
         };
 
-        let mut heap = HeapFile::new(start_page, 0);
+        // HeapFile logic:
+        // - If start_page is 0, it means "New/Unknown", so it will alloc a new page.
+        // - If start_page is fixed (1 or 2), it tries that page first.
+
+        let mut heap = HeapFile::new(start_page, start_page);
         let bytes = tuple.to_bytes(schema)?;
 
         let mut bp_guard = self.bp.lock().map_err(|_| "Lock poisoned")?;
         let txn_id = AtomicU32::new(0);
         let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-        // If targeting system tables, we force using the specific page ID to avoid
-        // "find_page_with_space" returning the wrong page (like returning page 2 for table 1).
-        // Note: This is a simplification. Real DBs use separate files or strict linking.
-        if start_page != 0 {
-            // Attempt to insert into specific start page directly
-            let frame = pinned_bp
-                .as_mut()
-                .fetch_page(start_page)
-                .map_err(|e| format!("{:?}", e))?;
-            let fid = frame.fid();
-
-            // Scope for page view
-            let inserted = {
-                let mut view = frame.page_view();
-                if let crate::storage::page::base::Page::SlottedData(slotted) = &mut view {
-                    slotted.add_slot(&bytes).is_ok()
-                } else {
-                    false
-                }
-            };
-
-            if inserted {
-                pinned_bp.as_mut().mark_frame_dirty(fid);
-                pinned_bp.as_mut().unpin_frame(fid).ok();
-                return Ok(());
-            }
-            pinned_bp.as_mut().unpin_frame(fid).ok();
-            // If failed (full), fall back to standard heap insert
-        }
-
-        heap.insert(pinned_bp, &txn_id, &bytes)
+        // Use the catalog's main OID counter for page allocation
+        heap.insert(pinned_bp, &self.next_oid, &bytes)
             .map_err(|e| format!("Heap insert failed: {:?}", e))?;
 
         Ok(())

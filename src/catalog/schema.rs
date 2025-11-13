@@ -1,12 +1,9 @@
 use crate::rt_type::primitives::{AttributeKind, TableAttribute, TableLayout, TableType};
-
-/// ID for the table that tracks other tables
 pub const SYSTEM_TABLES_ID: u32 = 1;
-/// ID for the table that tracks columns
 pub const SYSTEM_COLUMNS_ID: u32 = 2;
 
 /// Defines the schema for "system_tables"
-/// Columns: [oid (U32), table_name (Varchar)]
+/// Columns: [oid (U32), table_name (Varchar), root_page (U32)]
 pub fn get_system_tables_schema() -> TableType {
     TableType {
         attributes: vec![
@@ -22,8 +19,14 @@ pub fn get_system_tables_schema() -> TableType {
                 nullable: false,
                 is_internal: true,
             },
+            // NEW: Track where the table data starts
+            TableAttribute {
+                name: "root_page".to_string(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: true,
+            },
         ],
-        // Layout is ignored for packed tuples, but we keep the struct happy
         layout: TableLayout {
             size: 0,
             attr_layouts: vec![],
@@ -48,14 +51,12 @@ pub fn get_system_columns_schema() -> TableType {
                 nullable: false,
                 is_internal: true,
             },
-            // We map AttributeKind to a u8 (e.g., 1=Int, 2=Varchar)
             TableAttribute {
                 name: "col_type".to_string(),
                 kind: AttributeKind::U8,
                 nullable: false,
                 is_internal: true,
             },
-            // Max length for Char(N), or 0 for others
             TableAttribute {
                 name: "col_max_len".to_string(),
                 kind: AttributeKind::U16,

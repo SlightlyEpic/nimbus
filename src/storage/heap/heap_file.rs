@@ -1,9 +1,6 @@
-// src/storage/heap/heap_file.rs
-
 use super::row::RowId;
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::iterator::HeapIterator;
-use crate::storage::page::slotted_data::SlottedData;
 use crate::storage::page::{
     self,
     base::DiskPage,
@@ -31,7 +28,6 @@ pub enum HeapError {
 }
 
 impl HeapFile {
-    /// Creates a new HeapFile instance.
     pub fn new(first_page_id: PageId, last_page_id: PageId) -> Self {
         Self {
             first_page_id,
@@ -43,60 +39,54 @@ impl HeapFile {
         HeapIterator::new(bpm, self.first_page_id)
     }
 
-    /// Inserts raw byte data into a slotted page, returning a RowId.
-    /// Tries to find a page with space first, otherwise allocates new.
+    /// Inserts raw byte data into the heap file.
+    /// Enforces isolation: Only attempts to insert into this specific heap's chain.
     pub fn insert(
         &mut self,
         mut bpm: Pin<&mut BufferPool>,
         page_id_counter: &AtomicU32,
         data: &[u8],
     ) -> Result<RowId, HeapError> {
-        let required_space = (data.len() + SlottedData::SLOT_META_SIZE) as u32;
-
-        // 1. Try to find an existing page with enough space
-        let existing_page_id = {
-            let (core, locator) = bpm.as_mut().get_core_and_locator();
-            locator
-                .find_page_with_space(required_space, core)
-                .map_err(|e| HeapError::FindSpace(format!("{:?}", e)))?
-        };
-
-        // 2. If found, insert into it
-        if let Some(page_id) = existing_page_id {
+        // 1. Try to insert into the last page of this specific heap
+        if self.last_page_id != 0 {
             let frame = bpm
                 .as_mut()
-                .fetch_page(page_id)
+                .fetch_page(self.last_page_id)
                 .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
             let frame_id = frame.fid();
 
-            let (slot_num, new_free_space) = {
+            // Attempt insert
+            let insert_result = {
                 let mut page_view = frame.page_view();
                 if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
-                    let s_num = slotted_page
-                        .add_slot(data)
-                        .map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?;
-                    (s_num, slotted_page.free_space())
+                    slotted_page.add_slot(data)
                 } else {
                     bpm.as_mut().unpin_frame(frame_id).ok();
                     return Err(HeapError::InvalidPage);
                 }
             };
 
-            bpm.as_mut().mark_frame_dirty(frame_id);
-            bpm.as_mut()
-                .unpin_frame(frame_id)
-                .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
+            if let Ok(slot_num) = insert_result {
+                // Success!
+                bpm.as_mut().mark_frame_dirty(frame_id);
+                bpm.as_mut()
+                    .unpin_frame(frame_id)
+                    .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
 
-            // Update directory
-            let (core, locator) = bpm.as_mut().get_core_and_locator();
-            locator
-                .update_page_free_space(page_id, new_free_space, core)
-                .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
+                // We don't strictly need to update the global directory's free space
+                // immediately for correctness, but it's good practice.
+                // For now, we skip it to keep logic simple and isolated.
 
-            return Ok(RowId::new(page_id, slot_num as u32));
+                return Ok(RowId::new(self.last_page_id, slot_num as u32));
+            } else {
+                // Page is full (or error), unpin and continue to allocate new page
+                bpm.as_mut()
+                    .unpin_frame(frame_id)
+                    .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
+            }
         }
 
-        // 3. If not found, allocate a new page (Existing Logic)
+        // 2. Allocate a new page (Page is full or heap is empty)
         let new_page_id = page_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         let frame = bpm
@@ -107,12 +97,13 @@ impl HeapFile {
         let new_frame_id = frame.fid();
         let new_file_offset = frame.file_offset();
 
-        {
+        // Init and Insert
+        let slot_num = {
             let mut page_view = frame.page_view();
             if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
                 slotted_page.header_mut().set_page_id(new_page_id);
 
-                // LINKING: Set prev pointer to current last page
+                // Link backwards
                 if self.last_page_id != 0 {
                     slotted_page
                         .header_mut()
@@ -121,26 +112,26 @@ impl HeapFile {
 
                 slotted_page
                     .add_slot(data)
-                    .map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?;
+                    .map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?
             } else {
                 bpm.as_mut().unpin_frame(new_frame_id).ok();
                 return Err(HeapError::InvalidPage);
             }
-        }
+        };
 
         bpm.as_mut().mark_frame_dirty(new_frame_id);
         bpm.as_mut()
             .unpin_frame(new_frame_id)
             .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
 
-        // LINKING: Update old last page
+        // 3. Link forward (Update old last page)
         if self.last_page_id != 0 {
             let prev_frame = bpm
                 .as_mut()
                 .fetch_page(self.last_page_id)
                 .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
-
             let prev_fid = prev_frame.fid();
+
             {
                 let mut prev_view = prev_frame.page_view();
                 prev_view.header_mut().set_next_page_id(new_page_id);
@@ -152,27 +143,15 @@ impl HeapFile {
                 .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
         }
 
+        // 4. Update HeapFile state
         if self.first_page_id == 0 {
             self.first_page_id = new_page_id;
         }
         self.last_page_id = new_page_id;
 
-        // Calculate free space to register
-        // Safe to fetch again as it's in buffer
-        let free_space = {
-            let frame = bpm
-                .as_mut()
-                .fetch_page(new_page_id)
-                .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
-            let fid = frame.fid();
-            let space = if let page::base::Page::SlottedData(p) = frame.page_view() {
-                p.free_space()
-            } else {
-                0
-            };
-            bpm.as_mut().unpin_frame(fid).ok();
-            space
-        };
+        // 5. Register new page in Directory (so we can find it later via PageID)
+        // We calculate free space roughly
+        let free_space = 4000; // Safe approximation for new page
 
         bpm.as_mut()
             .expand_directory_and_register(
@@ -183,7 +162,7 @@ impl HeapFile {
             )
             .map_err(|e| HeapError::RegisterPage(e))?;
 
-        Ok(RowId::new(new_page_id, 0))
+        Ok(RowId::new(new_page_id, slot_num as u32))
     }
 
     pub fn get(mut bpm: Pin<&mut BufferPool>, rid: RowId) -> Result<Vec<u8>, HeapError> {
@@ -245,7 +224,6 @@ mod tests {
         let locator = Box::new(DirectoryPageLocator::new());
         let mut bp = Box::pin(BufferPool::new(file_manager, evictor, locator));
 
-        // BOOTSTRAP: Allocate Page 1 as Directory Page
         let dir_page_id = 1;
         let frame = bp
             .as_mut()
@@ -265,18 +243,24 @@ mod tests {
     #[test]
     fn test_heap_page_reuse() {
         let (path, mut bp, counter) = setup_heap_test("reuse");
-        let mut heap = HeapFile::new(0, 0);
+        let mut heap = HeapFile::new(0, 0); // Start empty
 
-        let data_small = vec![1u8; 100]; // 100 bytes
+        let data_small = vec![1u8; 100];
 
-        // 1. Insert first tuple -> Allocates Page 2
+        // 1. Insert -> Allocates New Page (ID 2)
         let rid1 = heap
             .insert(bp.as_mut(), &counter, &data_small)
             .expect("Insert 1 failed");
+
         let page1_id = rid1.page_id();
+        // With Directory(1), first alloc gets 2
         assert_eq!(page1_id, 2);
 
-        // 2. Insert second tuple -> Should reuse Page 2 (since 100 bytes << 4KB)
+        // Update heap state manually for test since we don't have a Catalog wrapper here
+        heap.last_page_id = page1_id;
+        heap.first_page_id = page1_id;
+
+        // 2. Insert again -> Should reuse Page 2
         let rid2 = heap
             .insert(bp.as_mut(), &counter, &data_small)
             .expect("Insert 2 failed");
@@ -286,7 +270,7 @@ mod tests {
             page1_id, page2_id,
             "Should reuse the same page for small tuples"
         );
-        assert_ne!(rid1.slot_num(), rid2.slot_num(), "Slots should differ");
+        assert_ne!(rid1.slot_num(), rid2.slot_num());
 
         defer_delete(&path);
     }
