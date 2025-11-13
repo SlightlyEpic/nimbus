@@ -8,7 +8,7 @@ pub struct LayoutReadWriter<'a> {
 }
 
 impl<'a> LayoutReadWriter<'a> {
-    fn new(layout: &'a primitives::TableLayout) -> LayoutReadWriter<'a> {
+    pub fn new(layout: &'a primitives::TableLayout) -> LayoutReadWriter<'a> {
         Self { layout }
     }
 
@@ -24,7 +24,7 @@ impl<'a> LayoutReadWriter<'a> {
     pub fn read_attr(
         &self,
         attr: &TableAttribute,
-        page: &[u8; constants::storage::PAGE_SIZE],
+        buffer: &[u8],
         base_offset: u16,
     ) -> Result<AttributeValue, errors::ReadAttrError> {
         let offset = base_offset
@@ -33,7 +33,11 @@ impl<'a> LayoutReadWriter<'a> {
                 .ok_or(errors::ReadAttrError::BadSlice)?;
 
         let offset_us = offset as usize;
-        let slice = &page[offset_us..offset_us + attr.kind.size_of()];
+        // Add bounds check
+        if offset_us + attr.kind.size_of() > buffer.len() {
+            return Err(errors::ReadAttrError::BadSlice);
+        }
+        let slice = &buffer[offset_us..offset_us + attr.kind.size_of()];
 
         match attr.kind {
             AttributeKind::U8 => Ok(AttributeValue::U8(u8::from_le_bytes(
@@ -110,8 +114,9 @@ impl<'a> LayoutReadWriter<'a> {
                 if actual_len > max_size {
                     return Err(errors::ReadAttrError::BadStringValue);
                 }
+                // Safety check for buffer read
                 if slice.len() < 1 + actual_len {
-                    return Err(errors::ReadAttrError::BadSlice); // invalid length
+                    return Err(errors::ReadAttrError::BadSlice);
                 }
 
                 let str_bytes = &slice[1..1 + actual_len];
@@ -126,8 +131,8 @@ impl<'a> LayoutReadWriter<'a> {
     pub fn write_attr(
         &self,
         attr: &TableAttribute,
-        value: AttributeValue,
-        page: &mut [u8; constants::storage::PAGE_SIZE],
+        value: &AttributeValue, // Changed to reference for efficiency
+        buffer: &mut [u8],      // Changed from &mut [u8; PAGE_SIZE]
         base_offset: u16,
     ) -> Result<(), errors::WriteAttrError> {
         let offset = base_offset
@@ -137,7 +142,12 @@ impl<'a> LayoutReadWriter<'a> {
 
         let offset_us = offset as usize;
         let size = attr.kind.size_of();
-        let buf = &mut page[offset_us..offset_us + size];
+
+        if offset_us + size > buffer.len() {
+            return Err(errors::WriteAttrError::OffsetOutOfBounds);
+        }
+
+        let buf = &mut buffer[offset_us..offset_us + size];
 
         match (attr.kind, value) {
             (AttributeKind::U8, AttributeValue::U8(v)) => {
@@ -177,7 +187,7 @@ impl<'a> LayoutReadWriter<'a> {
                 buf.copy_from_slice(&v.to_le_bytes());
             }
             (AttributeKind::Bool, AttributeValue::Bool(v)) => {
-                buf[0] = if v { 1 } else { 0 };
+                buf[0] = if *v { 1 } else { 0 };
             }
             (AttributeKind::Char(max_size), AttributeValue::Char(s)) => {
                 let bytes = s.as_bytes();
@@ -201,12 +211,14 @@ impl<'a> LayoutReadWriter<'a> {
 }
 
 pub mod errors {
+    #[derive(Debug)]
     pub enum WriteAttrError {
         BadAttribute,
         ValueKindMismatch,
         OffsetOutOfBounds,
     }
 
+    #[derive(Debug)]
     pub enum ReadAttrError {
         BadAttribute,
         BadSlice,
