@@ -1,9 +1,9 @@
 use super::executor::Executor;
 use crate::storage::heap::tuple::Tuple;
 
+// Indices of the columns to keep (e.g., [0, 2] keeps the 1st and 3rd columns)
 pub struct ProjectionExecutor<'a> {
     child: Box<dyn Executor + 'a>,
-    // Indices of the columns to keep (e.g., [0, 2] keeps column 0 and 2)
     column_indices: Vec<usize>,
 }
 
