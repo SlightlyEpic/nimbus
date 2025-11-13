@@ -2,7 +2,7 @@ use crate::storage::page::base::PageId;
 
 /// A RowId uniquely identifies a row on a SlottedData page.
 /// It's packed into a u64 to be stored as a value in the B+ Tree.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowId(u64);
 
 impl RowId {
@@ -41,20 +41,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_row_id_packing() {
+    fn test_row_id_packing_unpacking() {
         let page_id: PageId = 123;
         let slot_num: u32 = 456;
 
         let rid = RowId::new(page_id, slot_num);
         let packed = rid.to_u64();
 
-        // 123 << 32 | 456
-        // 0x0000007B 000001C8
-        let expected_packed: u64 = 528280977848;
+        // 123 (0x7B) in high 32 bits, 456 (0x1C8) in low 32 bits
+        // 0x0000007B_000001C8
+        // Calculation: 123 * 2^32 + 456 = 528280977864
+        let expected_packed: u64 = 528280977864;
         assert_eq!(packed, expected_packed);
 
         let unpacked_rid = RowId::from_u64(packed);
         assert_eq!(unpacked_rid.page_id(), page_id);
         assert_eq!(unpacked_rid.slot_num(), slot_num);
+    }
+
+    #[test]
+    fn test_row_id_zero_values() {
+        let page_id: PageId = 0;
+        let slot_num: u32 = 0;
+
+        let rid = RowId::new(page_id, slot_num);
+        assert_eq!(rid.to_u64(), 0);
+
+        let unpacked_rid = RowId::from_u64(0);
+        assert_eq!(unpacked_rid.page_id(), 0);
+        assert_eq!(unpacked_rid.slot_num(), 0);
+    }
+
+    #[test]
+    fn test_row_id_max_values() {
+        let page_id: PageId = u32::MAX;
+        let slot_num: u32 = u32::MAX;
+
+        let rid = RowId::new(page_id, slot_num);
+        assert_eq!(rid.to_u64(), u64::MAX);
+
+        let unpacked_rid = RowId::from_u64(u64::MAX);
+        assert_eq!(unpacked_rid.page_id(), u32::MAX);
+        assert_eq!(unpacked_rid.slot_num(), u32::MAX);
     }
 }

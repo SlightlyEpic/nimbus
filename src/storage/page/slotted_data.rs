@@ -1,14 +1,14 @@
 use crate::constants;
-use crate::storage::page::base;
-use std::marker::PhantomPinned;
+use crate::storage::page::base::DiskPage;
+use crate::storage::page::{base, header::PageHeader};
 
-// Slotted page implementation
 pub struct SlottedData<'a> {
     raw: &'a mut base::PageBuf,
 }
 
 impl<'a> base::DiskPage for SlottedData<'a> {
     const PAGE_KIND: u8 = base::PageKind::SlottedData as u8;
+    const DATA_START: usize = PageHeader::SIZE; // Data starts after the header
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
@@ -20,136 +20,132 @@ impl<'a> base::DiskPage for SlottedData<'a> {
 }
 
 impl<'a> SlottedData<'a> {
-    // === Memory layout ===
-    //   0..  1 -> Page Kind  (u8)         -|
-    //   4..  8 -> Free space (u32)         | Header (64 bytes)
-    //   8.. 16 -> Page Id    (u64)         |
-    //  16.. 64 -> Reserved for future use -|
-    //  64.. 66 -> # of slots (u16)
-    //  66.. 68 -> Slot offset #1 (u16)
-    //  68.. 70 -> Slot #1 len (u16)
-    //  ...(slot offsets, slot lengths)
-    //  ...data (from the end)
+    // Bytes:   | +0        | +1        | +2        | +3        |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 0..31    |            PageHeader (32 bytes)              |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 32..35   | Slot 0 offset(u16) | Slot 0 len(u16)          |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 36..39   | Slot 1 offset(u16) | Slot 1 len(u16)          |
+    // ---------+-----------+-----------+-----------+-----------|
+    // ...      | (Slot array grows downwards)                  |
+    // ---------+-----------------------------------------------|
+    //          |          <<< FREE SPACE >>>                   |
+    //          | (Gap between end of slot array and fsp)       |
+    // ---------+-----------------------------------------------|
+    // ...      | (Data grows upwards from the end)             |
+    // ---------+-----------+-----------+-----------+-----------|
+    // (fsp)..  |              Data for Slot 1                  |
+    // ---------+-----------+-----------+-----------+-----------|
+    // ...      |              Data for Slot 0                  |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 4095     | (End of Page)                                 |
+    // ---------------------------------------------------------|
+    const SLOT_META_SIZE: usize = 4; // u16 offset + u16 len
 
-    pub const fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
-        let mut page = Self { raw };
-        page.set_page_kind(base::PageKind::SlottedData);
-        page.set_free_space(constants::storage::PAGE_SIZE as u32 - 64 - 2);
-
-        page
+    /// Creates a new SlottedData page view from a raw buffer.
+    pub fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
+        Self { raw }
     }
 
     // === Direct Getters ===
 
-    pub const fn page_kind(&self) -> u8 {
-        self.raw[0]
+    /// Gets the PageId from the header.
+    pub fn page_id(&self) -> base::PageId {
+        self.header().page_id()
     }
 
-    pub const fn free_space(&self) -> u32 {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(4) as *const u32;
-            u32::from_le(*ptr)
-        }
-    }
-
-    pub const fn page_id(&self) -> base::PageId {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(8) as *const u64;
-            let val = u64::from_le(*ptr);
-            base::PageId::new(val).unwrap()
-        }
-    }
-
-    pub const fn num_slots(&self) -> u16 {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(64) as *const u16;
-            *ptr
-        }
-    }
-
-    pub const fn slot_offset(&self, idx: usize) -> Option<u16> {
+    /// Calculates the amount of free space.
+    pub fn free_space(&self) -> u32 {
         let num_slots = self.num_slots() as usize;
-        if idx >= num_slots {
+        let meta_end = Self::DATA_START + (num_slots * Self::SLOT_META_SIZE);
+        let data_start = self.header().free_space_pointer() as usize;
+
+        if data_start < meta_end {
+            0 // Should not happen
+        } else {
+            (data_start - meta_end) as u32
+        }
+    }
+
+    /// Gets the number of slots from the header.
+    pub fn num_slots(&self) -> u16 {
+        self.header().num_entries()
+    }
+
+    /// Gets the raw pointer to the slot's offset metadata.
+    fn slot_offset_ptr(&self, idx: usize) -> *const u16 {
+        let base = Self::DATA_START + Self::SLOT_META_SIZE * idx;
+        unsafe { self.raw.as_ptr().add(base) as *const u16 }
+    }
+
+    /// Gets the raw pointer to the slot's length metadata.
+    fn slot_len_ptr(&self, idx: usize) -> *const u16 {
+        let base = Self::DATA_START + Self::SLOT_META_SIZE * idx + 2;
+        unsafe { self.raw.as_ptr().add(base) as *const u16 }
+    }
+
+    /// Gets the offset of the data for a given slot.
+    pub fn slot_offset(&self, idx: usize) -> Option<u16> {
+        if idx >= self.num_slots() as usize {
             return None;
         }
-        let base = 66 + 4 * idx;
-        unsafe {
-            let ptr = self.raw.as_ptr().add(base) as *const u16;
-            Some(*ptr)
-        }
+        unsafe { Some(u16::from_le(*self.slot_offset_ptr(idx))) }
     }
 
-    pub const fn slot_size(&self, idx: usize) -> Option<u16> {
-        let num_slots = self.num_slots() as usize;
-        if idx >= num_slots {
+    /// Gets the size of the data for a given slot.
+    pub fn slot_size(&self, idx: usize) -> Option<u16> {
+        if idx >= self.num_slots() as usize {
             return None;
         }
-        let base = 66 + 4 * idx + 2;
-        unsafe {
-            let ptr = self.raw.as_ptr().add(base) as *const u16;
-            Some(*ptr)
-        }
+        unsafe { Some(u16::from_le(*self.slot_len_ptr(idx))) }
     }
 
     // === Indirect Getters ===
 
+    /// Gets an immutable slice to the data in the specified slot.
     pub fn slot_data(&self, idx: usize) -> Option<&[u8]> {
-        let num_slots = self.num_slots() as usize;
-        if idx >= num_slots {
+        let offset = self.slot_offset(idx)? as usize;
+        let size = self.slot_size(idx)? as usize;
+
+        // Check for tombstone (len 0) or invalid offset
+        if size == 0 || offset == 0 {
             return None;
         }
-        let offset = unsafe { self.slot_offset(idx).unwrap_unchecked() } as usize;
-        let size = unsafe { self.slot_size(idx).unwrap_unchecked() } as usize;
         Some(&self.raw[offset..offset + size])
     }
 
+    /// Gets a mutable slice to the data in the specified slot.
     pub fn slot_data_mut(&mut self, idx: usize) -> Option<&mut [u8]> {
-        let num_slots = self.num_slots() as usize;
-        if idx >= num_slots {
+        let offset = self.slot_offset(idx)? as usize;
+        let size = self.slot_size(idx)? as usize;
+
+        // Check for tombstone (len 0) or invalid offset
+        if size == 0 || offset == 0 {
             return None;
         }
-        let offset = unsafe { self.slot_offset(idx).unwrap_unchecked() } as usize;
-        let size = unsafe { self.slot_size(idx).unwrap_unchecked() } as usize;
         Some(&mut self.raw[offset..offset + size])
     }
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: base::PageKind) {
-        self.raw[0] = kind as u8;
+    /// Sets the PageId in the header.
+    pub fn set_page_id(&mut self, id: base::PageId) {
+        self.header_mut().set_page_id(id);
     }
 
-    const fn set_free_space(&mut self, free: u32) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(4) as *mut u32;
-            *ptr = free.to_le();
-        }
-    }
-
-    pub const fn set_page_id(&mut self, id: base::PageId) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
-            *ptr = id.get().to_le();
-        }
-    }
-
-    const fn set_num_slots(&mut self, num_slots: u16) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(64) as *mut u16;
-            *ptr = num_slots.to_le();
-        }
-    }
-
-    const fn set_slot_offset_unchecked(&mut self, idx: usize, offset: u16) {
-        let base = 66 + 4 * idx;
+    /// Writes the slot's offset metadata
+    fn set_slot_offset_unchecked(&mut self, idx: usize, offset: u16) {
+        let base = Self::DATA_START + Self::SLOT_META_SIZE * idx;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u16;
             *ptr = offset.to_le();
         }
     }
 
-    const fn set_slot_size_unchecked(&mut self, idx: usize, size: u16) {
-        let base = 66 + 4 * idx + 2;
+    /// Writes the slot's size metadata
+    fn set_slot_size_unchecked(&mut self, idx: usize, size: u16) {
+        let base = Self::DATA_START + Self::SLOT_META_SIZE * idx + 2;
         unsafe {
             let ptr = self.raw.as_mut_ptr().add(base) as *mut u16;
             *ptr = size.to_le();
@@ -158,80 +154,72 @@ impl<'a> SlottedData<'a> {
 
     // === Indirect Setters ===
 
-    /// Result<slot_index, error>
-    pub const fn add_slot(&mut self, data: &[u8]) -> Result<u16, errors::AddSlotError> {
-        let free_space = self.free_space() as usize;
+    /// Adds a new data slot to the page.
+    /// Returns the slot index (u16) if successful.
+    pub fn add_slot(&mut self, data: &[u8]) -> Result<u16, errors::AddSlotError> {
         let data_len = data.len();
-        if free_space < data_len + 4 {
+        if data_len == 0 {
+            return Err(errors::AddSlotError::DataEmpty);
+        }
+
+        let total_needed = data_len + Self::SLOT_META_SIZE;
+        if self.free_space() < total_needed as u32 {
             return Err(errors::AddSlotError::InsufficientSpace);
         }
 
-        let num_slots = self.num_slots() as usize;
-        let last_offset = match num_slots {
-            0 => constants::storage::PAGE_SIZE,
-            _ => unsafe { self.slot_offset(num_slots - 1).unwrap_unchecked() as usize },
-        };
-        let slot_offset = last_offset - data_len;
+        let num_slots = self.num_slots();
+        let free_ptr = self.header().free_space_pointer();
+        let new_data_offset = free_ptr - data_len as u16;
 
-        self.set_num_slots(num_slots as u16 + 1);
-        self.set_free_space((free_space - data_len - 4) as u32);
-        self.set_slot_offset_unchecked(num_slots, slot_offset as u16);
-        self.set_slot_size_unchecked(num_slots, data_len as u16);
+        // Write the data itself (from the end of the page)
+        self.raw[new_data_offset as usize..free_ptr as usize].copy_from_slice(data);
 
-        Ok(num_slots as u16)
+        // Write the slot metadata (from the start of the data area)
+        self.set_slot_offset_unchecked(num_slots as usize, new_data_offset);
+        self.set_slot_size_unchecked(num_slots as usize, data_len as u16);
+
+        // Update header
+        self.header_mut().set_num_entries(num_slots + 1);
+        self.header_mut().set_free_space_pointer(new_data_offset);
+
+        Ok(num_slots)
     }
 
-    pub const fn remove_slot_at(&mut self, idx: usize) -> Result<(), errors::RemoveSlotError> {
+    /// Removes a slot by swapping it with the last slot.
+    /// Note: This does not reclaim the data space (no compaction).
+    pub fn remove_slot_at(&mut self, idx: usize) -> Result<(), errors::RemoveSlotError> {
         let num_slots = self.num_slots();
         if idx >= num_slots as usize {
             return Err(errors::RemoveSlotError::IndexOutOfBounds);
         }
 
-        let rm_slot_offset = unsafe { self.slot_offset(idx).unwrap_unchecked() as usize };
-        let rm_slot_size = unsafe { self.slot_size(idx).unwrap_unchecked() as usize };
-        unsafe {
-            std::ptr::write_bytes(
-                self.raw.as_mut_ptr().add(rm_slot_offset as usize),
-                0,
-                rm_slot_size as usize,
-            );
+        if idx != (num_slots - 1) as usize {
+            // Not the last slot, so swap with last
+            let last_slot_offset = self.slot_offset(num_slots as usize - 1).unwrap();
+            let last_slot_size = self.slot_size(num_slots as usize - 1).unwrap();
+
+            self.set_slot_offset_unchecked(idx, last_slot_offset);
+            self.set_slot_size_unchecked(idx, last_slot_size);
         }
 
-        if idx != num_slots as usize - 1 {
-            // Move slot data
-            let last_slot_offset =
-                unsafe { self.slot_offset(num_slots as usize - 1).unwrap_unchecked() as usize };
-            let combined_data_size = rm_slot_offset - last_slot_offset;
-            unsafe {
-                std::ptr::copy(
-                    self.raw.as_mut_ptr().add(last_slot_offset as usize),
-                    self.raw.as_mut_ptr().add(last_slot_offset + rm_slot_size),
-                    combined_data_size,
-                )
-            }
+        // Update header (simply decrementing count effectively removes the last slot)
+        self.header_mut().set_num_entries(num_slots - 1);
 
-            // Move slot offsets and sizes
-            let slot_meta_start = 66 + idx * 4 + 4;
-            let slot_meta_end = 66 + idx * num_slots as usize + 4;
-            let slot_meta_size = slot_meta_end - slot_meta_start;
-            unsafe {
-                std::ptr::copy(
-                    self.raw.as_mut_ptr().add(slot_meta_start),
-                    self.raw.as_mut_ptr().add(slot_meta_start - 4),
-                    slot_meta_size,
-                );
-            }
-        }
+        // TODO: Add compaction logic to reclaim free_space_pointer
+        // For now, space is "lost" until the page is rebuilt.
 
         Ok(())
     }
 }
 
 pub mod errors {
+    #[derive(Debug)]
     pub enum AddSlotError {
         InsufficientSpace,
+        DataEmpty,
     }
 
+    #[derive(Debug)]
     pub enum RemoveSlotError {
         IndexOutOfBounds,
     }

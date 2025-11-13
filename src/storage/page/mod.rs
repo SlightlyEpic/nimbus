@@ -7,3 +7,4 @@ pub use bplus_inner::BPlusInner;
 pub use bplus_leaf::BPlusLeaf;
 pub use directory::Directory;
 pub use slotted_data::SlottedData;
+pub mod header;

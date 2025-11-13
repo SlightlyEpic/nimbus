@@ -1,0 +1,311 @@
+use crate::storage::buffer::buffer_pool::{self, BufferPool};
+use crate::storage::page::{
+    self,
+    base::{self, DiskPage, Page, PageId, PageKind},
+    bplus_inner::{BPlusInner, BPlusInnerSplitData},
+    bplus_leaf::BPlusLeaf,
+    header::PageHeader,
+};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+#[derive(Debug)]
+pub struct SplitResult {
+    pub split_key: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum BTreeError {
+    PageNotFound,
+    SplitError(String),
+    KeyNotFound,
+    DeleteError(String),
+    FindError(String),
+    BufferPoolError(buffer_pool::errors::FetchPageError),
+    AllocError(buffer_pool::errors::AllocNewPageError),
+    UnpinError(buffer_pool::errors::UnpinFrameError),
+}
+
+impl From<buffer_pool::errors::FetchPageError> for BTreeError {
+    fn from(e: buffer_pool::errors::FetchPageError) -> Self {
+        BTreeError::BufferPoolError(e)
+    }
+}
+
+impl From<buffer_pool::errors::AllocNewPageError> for BTreeError {
+    fn from(e: buffer_pool::errors::AllocNewPageError) -> Self {
+        BTreeError::AllocError(e)
+    }
+}
+
+impl From<buffer_pool::errors::UnpinFrameError> for BTreeError {
+    fn from(e: buffer_pool::errors::UnpinFrameError) -> Self {
+        BTreeError::UnpinError(e)
+    }
+}
+
+impl From<&'static str> for BTreeError {
+    fn from(s: &'static str) -> Self {
+        BTreeError::FindError(s.to_string())
+    }
+}
+
+enum SplitData {
+    NoSplit,
+    Split { key: Vec<u8>, right_page_id: PageId },
+}
+
+pub struct BplusTree {
+    root_page_id: PageId,
+    key_size: u32,
+}
+
+impl BplusTree {
+    pub fn new(root_page_id: PageId, key_size: u32) -> Self {
+        Self {
+            root_page_id,
+            key_size,
+        }
+    }
+
+    pub fn get_root_page_id(&self) -> PageId {
+        self.root_page_id
+    }
+
+    fn register_page(
+        &self,
+        page_id: PageId,
+        offset: u64,
+        mut bpm: Pin<&mut BufferPool>,
+        page_id_counter: &AtomicU32,
+    ) -> Result<(), BTreeError> {
+        bpm.as_mut()
+            .expand_directory_and_register(page_id, offset, 0, page_id_counter)
+            .map_err(|e| BTreeError::SplitError(e))?;
+        Ok(())
+    }
+
+    pub fn find(
+        &self,
+        key: &[u8],
+        mut bpm: Pin<&mut BufferPool>,
+    ) -> Result<Option<u64>, BTreeError> {
+        self.find_recursive(self.root_page_id, key, bpm)
+    }
+
+    fn find_recursive(
+        &self,
+        current_page_id: PageId,
+        key: &[u8],
+        mut bpm: Pin<&mut BufferPool>,
+    ) -> Result<Option<u64>, BTreeError> {
+        let frame = bpm.as_mut().fetch_page(current_page_id)?;
+        let frame_id = frame.fid();
+        let mut page_view = frame.page_view();
+
+        let result = match &mut page_view {
+            Page::BPlusLeaf(leaf) => {
+                let value = leaf.get_value(key);
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                id
+            };
+
+            let right_frame = bpm.as_mut().fetch_page(right_sibling_id)?;
+            let can_give = match right_frame.page_view() {
+                Page::BPlusLeaf(leaf) => leaf.can_give_key(),
+                Page::BPlusInner(inner) => inner.can_give_key(),
+                _ => false,
+            };
+            bpm.as_mut().unpin_frame(right_frame.fid())?;
+
+            if can_give {
+                let separator_key = {
+                    let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                    let key = if let Page::BPlusInner(p) = parent_frame.page_view() {
+                        p.get_key_at(child_index).to_vec()
+                    } else {
+                        panic!("not inner");
+                    };
+                    bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                    key
+                };
+
+                let right_frame = bpm.as_mut().fetch_page(right_sibling_id)?;
+                let right_fid = right_frame.fid();
+                let mut right_page_view = right_frame.page_view();
+
+                let child_frame = bpm.as_mut().fetch_page(child_id)?;
+                let child_fid = child_frame.fid();
+                let mut child_page_view = child_frame.page_view();
+
+                let new_separator_key = match (&mut right_page_view, &mut child_page_view) {
+                    (Page::BPlusLeaf(right_leaf), Page::BPlusLeaf(child_leaf)) => {
+                        right_leaf.move_first_to_end_of(child_leaf)
+                    }
+                    (Page::BPlusInner(right_inner), Page::BPlusInner(child_inner)) => {
+                        right_inner.move_first_to_end_of(child_inner, &separator_key)
+                    }
+                    _ => panic!("Sibling type mismatch"),
+                };
+
+                bpm.as_mut().mark_frame_dirty(right_fid);
+                bpm.as_mut().unpin_frame(right_fid)?;
+                bpm.as_mut().mark_frame_dirty(child_fid);
+                bpm.as_mut().unpin_frame(child_fid)?;
+
+                let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                if let Page::BPlusInner(p) = parent_frame.page_view() {
+                    let child_ptr = p.get_child_id_at_entry(child_index);
+                    p.set_entry(child_index, &new_separator_key, child_ptr);
+                }
+                bpm.as_mut().mark_frame_dirty(parent_frame.fid());
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+
+                return Ok(());
+            }
+        }
+
+        if child_index > 0 {
+            let left_sibling_id = {
+                let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                let id = if let Page::BPlusInner(p) = parent_frame.page_view() {
+                    p.get_child_at(child_index - 1).unwrap()
+                } else {
+                    panic!("")
+                };
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                id
+            };
+            let separator_key = {
+                let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                let key = if let Page::BPlusInner(p) = parent_frame.page_view() {
+                    p.get_key_at(child_index - 1).to_vec()
+                } else {
+                    panic!("not inner");
+                };
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                key
+            };
+
+            let left_frame = bpm.as_mut().fetch_page(left_sibling_id)?;
+            let left_fid = left_frame.fid();
+            let mut left_page_view = left_frame.page_view();
+
+            let child_frame = bpm.as_mut().fetch_page(child_id)?;
+            let child_fid = child_frame.fid();
+            let mut child_page_view = child_frame.page_view();
+
+            let child_next_sibling = child_page_view.header().next_page_id();
+
+            match (&mut left_page_view, &mut child_page_view) {
+                (Page::BPlusLeaf(left_leaf), Page::BPlusLeaf(child_leaf)) => {
+                    left_leaf.merge_from(child_leaf);
+                }
+                (Page::BPlusInner(left_inner), Page::BPlusInner(child_inner)) => {
+                    left_inner.merge_from(child_inner, &separator_key);
+                    left_inner.set_next_sibling(child_inner.next_sibling());
+                }
+                _ => panic!("Sibling type mismatch"),
+            };
+
+            bpm.as_mut().mark_frame_dirty(left_fid);
+            bpm.as_mut().unpin_frame(left_fid)?;
+            bpm.as_mut().unpin_frame(child_fid)?;
+
+            if child_next_sibling != 0 {
+                let next_frame = bpm.as_mut().fetch_page(child_next_sibling)?;
+                next_frame
+                    .page_view()
+                    .header_mut()
+                    .set_prev_page_id(left_sibling_id);
+                bpm.as_mut().mark_frame_dirty(next_frame.fid());
+                bpm.as_mut().unpin_frame(next_frame.fid())?;
+            }
+
+            let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+            if let Page::BPlusInner(p) = parent_frame.page_view() {
+                p.remove_at(child_index - 1);
+            }
+            bpm.as_mut().mark_frame_dirty(parent_frame.fid());
+            bpm.as_mut().unpin_frame(parent_frame.fid())?;
+
+            return Ok(());
+        } else {
+            let right_sibling_id = {
+                let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                let id = if let Page::BPlusInner(p) = parent_frame.page_view() {
+                    p.get_child_at(child_index + 1).unwrap()
+                } else {
+                    panic!("")
+                };
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                id
+            };
+            let separator_key = {
+                let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+                let key = if let Page::BPlusInner(p) = parent_frame.page_view() {
+                    p.get_key_at(child_index).to_vec()
+                } else {
+                    panic!("not inner");
+                };
+                bpm.as_mut().unpin_frame(parent_frame.fid())?;
+                key
+            };
+
+            let right_frame = bpm.as_mut().fetch_page(right_sibling_id)?;
+            let right_fid = right_frame.fid();
+            let mut right_page_view = right_frame.page_view();
+
+            let child_frame = bpm.as_mut().fetch_page(child_id)?;
+            let child_fid = child_frame.fid();
+            let mut child_page_view = child_frame.page_view();
+
+            let right_sibling_next_id = right_page_view.header().next_page_id();
+
+            match (&mut right_page_view, &mut child_page_view) {
+                (Page::BPlusLeaf(right_leaf), Page::BPlusLeaf(child_leaf)) => {
+                    child_leaf.merge_from(right_leaf);
+                    let next_id = if right_sibling_next_id == 0 {
+                        None
+                    } else {
+                        Some(right_sibling_next_id)
+                    };
+                    child_leaf.set_next_sibling(next_id);
+                }
+                (Page::BPlusInner(right_inner), Page::BPlusInner(child_inner)) => {
+                    child_inner.merge_from(right_inner, &separator_key);
+                    let next_id = if right_sibling_next_id == 0 {
+                        None
+                    } else {
+                        Some(right_sibling_next_id)
+                    };
+                    child_inner.set_next_sibling(next_id);
+                }
+                _ => panic!("Sibling type mismatch"),
+            };
+
+            bpm.as_mut().mark_frame_dirty(child_fid);
+            bpm.as_mut().unpin_frame(child_fid)?;
+            bpm.as_mut().unpin_frame(right_fid)?;
+
+            if right_sibling_next_id != 0 {
+                let next_frame = bpm.as_mut().fetch_page(right_sibling_next_id)?;
+                next_frame
+                    .page_view()
+                    .header_mut()
+                    .set_prev_page_id(child_id);
+                bpm.as_mut().mark_frame_dirty(next_frame.fid());
+                bpm.as_mut().unpin_frame(next_frame.fid())?;
+            }
+
+            let parent_frame = bpm.as_mut().fetch_page(parent_id)?;
+            if let Page::BPlusInner(p) = parent_frame.page_view() {
+                p.remove_at(child_index);
+            }
+            bpm.as_mut().mark_frame_dirty(parent_frame.fid());
+            bpm.as_mut().unpin_frame(parent_frame.fid())?;
+
+            return Ok(());
+        }
+    }
+}
