@@ -1,7 +1,9 @@
 use super::executor::Executor;
 use crate::catalog::manager::Catalog;
 use crate::rt_type::primitives::{AttributeValue, TableType};
+use crate::storage::buffer::BufferPool;
 use crate::storage::heap::tuple::Tuple;
+use std::pin::Pin;
 
 pub struct InsertExecutor<'a> {
     child: Box<dyn Executor + 'a>,
@@ -37,17 +39,20 @@ impl<'a> Executor for InsertExecutor<'a> {
         self.executed = false;
     }
 
-    fn next(&mut self) -> Option<Tuple> {
+    fn next(&mut self, mut bpm: Pin<&mut BufferPool>) -> Option<Tuple> {
+        // Added bpm
         if self.executed {
             return None;
         }
 
         let mut count = 0;
-        while let Some(tuple) = self.child.next() {
+        while let Some(tuple) = self.child.next(bpm.as_mut()) {
+            // Pass bpm
             // Panic on error for now (Prototype phase)
-            if let Err(e) = self
-                .catalog
-                .insert_tuple(self.table_oid, &tuple, &self.schema)
+            if let Err(e) =
+                self.catalog
+                    .insert_tuple(self.table_oid, &tuple, &self.schema, bpm.as_mut())
+            // Pass bpm
             {
                 panic!("Insert failed: {}", e);
             }
@@ -116,10 +121,14 @@ mod tests {
         let values_exec = Box::new(ValuesExecutor::new(tuples));
 
         // 3. Execute Insert
+        let mut bp_guard = bp.lock().unwrap();
+        let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
         let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap();
         insert_exec.init();
 
-        let result = insert_exec.next().expect("Should return count");
+        let result = insert_exec
+            .next(pinned_bp.as_mut())
+            .expect("Should return count"); // Pass bpm
 
         // Verify count = 3
         if let AttributeValue::U32(count) = result.values[0] {
@@ -129,14 +138,13 @@ mod tests {
         }
 
         // 4. Verify Data via SeqScan
-        let mut bp_guard = bp.lock().unwrap();
-        let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-        let mut scan_exec = SeqScanExecutor::new(pinned_bp.as_mut(), &catalog, table_oid).unwrap();
+        let mut scan_exec = SeqScanExecutor::new(&catalog, table_oid).unwrap(); // Removed bpm from args
         scan_exec.init();
 
         let mut fetched_count = 0;
-        while let Some(tuple) = scan_exec.next() {
+        while let Some(tuple) = scan_exec.next(pinned_bp.as_mut()) {
+            // Pass bpm
             println!("Scanned: {:?}", tuple);
             fetched_count += 1;
         }

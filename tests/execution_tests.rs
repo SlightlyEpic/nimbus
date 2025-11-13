@@ -5,10 +5,13 @@ use nimbus::execution::filter::FilterExecutor;
 use nimbus::execution::insert::InsertExecutor;
 use nimbus::execution::projection::ProjectionExecutor;
 use nimbus::execution::seq_scan::SeqScanExecutor;
+use nimbus::execution::update::UpdateExecutor;
 use nimbus::execution::values::ValuesExecutor;
 use nimbus::rt_type::primitives::{
     AttributeKind, AttributeValue, TableAttribute, TableLayout, TableType,
 };
+
+use nimbus::execution::index_scan::IndexScanExecutor;
 use nimbus::storage::buffer::BufferPool;
 use nimbus::storage::buffer::fifo_evictor::FifoEvictor;
 use nimbus::storage::disk::FileManager;
@@ -41,12 +44,12 @@ fn test_seq_scan_system_tables() {
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut scan = SeqScanExecutor::new(pinned_bp.as_mut(), &catalog, SYSTEM_TABLES_ID)
-        .expect("Failed to create scan");
-    scan.init();
+    let mut scan = SeqScanExecutor::new(&catalog, SYSTEM_TABLES_ID).expect("Failed to create scan");
+    scan.init(); // No bpm
 
     let mut count = 0;
-    while let Some(tuple) = scan.next() {
+    while let Some(tuple) = scan.next(pinned_bp.as_mut()) {
+        // Pass bpm
         println!("Found system row: {:?}", tuple);
         count += 1;
     }
@@ -83,17 +86,17 @@ fn test_insert_and_filter() {
         Tuple::new(vec![AttributeValue::U32(30)]),
     ];
     let values_exec = Box::new(ValuesExecutor::new(tuples));
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap();
 
-    insert_exec.init();
-    insert_exec.next(); // Execute insert
-
-    // 3. Scan & Filter
-    let mut bp_guard = bp.lock().unwrap();
+    let mut bp_guard = bp.lock().unwrap(); // Lock for insert
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let scan_exec =
-        Box::new(SeqScanExecutor::new(pinned_bp.as_mut(), &catalog, table_oid).unwrap());
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+
+    insert_exec.init(); // No bpm
+    insert_exec.next(pinned_bp.as_mut()); // Execute insert, pass bpm
+
+    // 3. Scan & Filter
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
 
     // Filter: WHERE age > 20
     let mut filter_exec = FilterExecutor::new(scan_exec, |t: &Tuple| match t.values[0] {
@@ -101,10 +104,11 @@ fn test_insert_and_filter() {
         _ => false,
     });
 
-    filter_exec.init();
+    filter_exec.init(); // No bpm
 
     let mut output_rows = 0;
-    while let Some(t) = filter_exec.next() {
+    while let Some(t) = filter_exec.next(pinned_bp.as_mut()) {
+        // Pass bpm
         if let AttributeValue::U32(age) = t.values[0] {
             assert!(age > 20);
         }
@@ -140,28 +144,28 @@ fn test_filter_execution() {
         Tuple::new(vec![AttributeValue::U32(30)]),
     ];
     let values_exec = Box::new(ValuesExecutor::new(tuples));
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap();
 
-    insert_exec.init();
-    insert_exec.next(); // Execute insert
-
-    // 3. Filter: WHERE age > 20
     let mut bp_guard = bp.lock().unwrap();
-    // Use unsafe pin because BufferPool is PhantomPinned
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let scan_exec =
-        Box::new(SeqScanExecutor::new(pinned_bp.as_mut(), &catalog, table_oid).unwrap());
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+
+    insert_exec.init(); // No bpm
+    insert_exec.next(pinned_bp.as_mut()); // Execute insert, pass bpm
+
+    // 3. Filter: WHERE age > 20
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
 
     let mut filter_exec = FilterExecutor::new(scan_exec, |t: &Tuple| match t.values[0] {
         AttributeValue::U32(age) => age > 20,
         _ => false,
     });
 
-    filter_exec.init();
+    filter_exec.init(); // No bpm
 
     let mut output_rows = 0;
-    while let Some(t) = filter_exec.next() {
+    while let Some(t) = filter_exec.next(pinned_bp.as_mut()) {
+        // Pass bpm
         println!("Filtered Row: {:?}", t);
         if let AttributeValue::U32(age) = t.values[0] {
             assert!(age > 20);
@@ -210,28 +214,174 @@ fn test_projection_execution() {
         ]),
     ];
     let values_exec = Box::new(ValuesExecutor::new(tuples));
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap();
-    insert_exec.init();
-    insert_exec.next();
 
-    // 3. Scan & Project: SELECT age FROM users
-    // "age" is at index 1
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let scan_exec =
-        Box::new(SeqScanExecutor::new(pinned_bp.as_mut(), &catalog, table_oid).unwrap());
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+    insert_exec.init(); // No bpm
+    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+
+    // 3. Scan & Project: SELECT age FROM users
+    // "age" is at index 1
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
 
     let mut proj_exec = ProjectionExecutor::new(scan_exec, vec![1]); // Keep only column 1 (age)
-    proj_exec.init();
+    proj_exec.init(); // No bpm
 
-    let t1 = proj_exec.next().expect("Should have result");
+    let t1 = proj_exec
+        .next(pinned_bp.as_mut())
+        .expect("Should have result"); // Pass bpm
     assert_eq!(t1.values.len(), 1);
     assert_eq!(t1.values[0], AttributeValue::U32(30));
 
-    let t2 = proj_exec.next().expect("Should have result");
+    let t2 = proj_exec
+        .next(pinned_bp.as_mut())
+        .expect("Should have result"); // Pass bpm
     assert_eq!(t2.values.len(), 1);
     assert_eq!(t2.values[0], AttributeValue::U32(20));
 
-    assert!(proj_exec.next().is_none());
+    assert!(proj_exec.next(pinned_bp.as_mut()).is_none()); // Pass bpm
+}
+
+#[test]
+fn test_index_maintenance() {
+    let (bp, mut catalog) = setup_catalog("test_idx_maint.db");
+
+    // 1. Create Table
+    let schema = TableType {
+        attributes: vec![
+            TableAttribute {
+                name: "id".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "val".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+        ],
+        layout: TableLayout {
+            size: 0,
+            attr_layouts: vec![],
+        },
+    };
+    let table_oid = catalog.create_table("data", schema.clone()).unwrap();
+
+    // 2. Create Index on 'id' (column 0)
+    let idx_oid = catalog.create_index("idx_id", "data", "id").unwrap();
+
+    // 3. Insert Data: (100, 1), (200, 2)
+    let tuples = vec![
+        Tuple::new(vec![AttributeValue::U32(100), AttributeValue::U32(1)]),
+        Tuple::new(vec![AttributeValue::U32(200), AttributeValue::U32(2)]),
+    ];
+    let values_exec = Box::new(ValuesExecutor::new(tuples));
+
+    let mut bp_guard = bp.lock().unwrap();
+    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+
+    insert_exec.init(); // No bpm
+    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+
+    // 4. Verify via Index Scan (Lookup 200)
+    // Key: 200
+    let key_bytes = 200u32.to_be_bytes().to_vec();
+    let mut idx_scan = IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap(); // No bpm
+
+    idx_scan.init(); // No bpm
+    let tuple = idx_scan
+        .next(pinned_bp.as_mut())
+        .expect("Index lookup failed for key 200"); // Pass bpm
+
+    assert_eq!(tuple.values[0], AttributeValue::U32(200));
+    assert_eq!(tuple.values[1], AttributeValue::U32(2));
+}
+
+#[test]
+fn test_update_execution() {
+    let (bp, mut catalog) = setup_catalog("test_update.db");
+
+    // 1. Create Table & Index
+    let schema = TableType {
+        attributes: vec![
+            TableAttribute {
+                name: "id".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "val".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+        ],
+        layout: TableLayout {
+            size: 0,
+            attr_layouts: vec![],
+        },
+    };
+    let table_oid = catalog.create_table("data", schema.clone()).unwrap();
+    let idx_oid = catalog.create_index("idx_id", "data", "id").unwrap();
+
+    // 2. Insert (1, 100)
+    let tuples = vec![Tuple::new(vec![
+        AttributeValue::U32(1),
+        AttributeValue::U32(100),
+    ])];
+    let values_exec = Box::new(ValuesExecutor::new(tuples));
+
+    let mut bp_guard = bp.lock().unwrap();
+    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+    insert_exec.init(); // No bpm
+    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+
+    // 3. Update: SET val = 200 WHERE id = 1
+    // Scan part
+    // Index Scan for id=1
+    let key_bytes = 1u32.to_be_bytes().to_vec();
+    let scan_exec = Box::new(IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap()); // No bpm
+
+    // Update Logic: Change val (col 1) to 200
+    let mut update_exec = UpdateExecutor::new(scan_exec, &catalog, table_oid, |old_t| {
+        let mut new_vals = old_t.values.clone();
+        new_vals[1] = AttributeValue::U32(200); // Update val
+        Tuple::new(new_vals)
+    }) // No bpm
+    .unwrap();
+
+    update_exec.init(); // No bpm
+    let res = update_exec
+        .next(pinned_bp.as_mut())
+        .expect("Update should return count"); // Pass bpm
+
+    if let AttributeValue::U32(count) = res.values[0] {
+        assert_eq!(count, 1);
+    }
+
+    // 4. Verify: Scan should see (1, 200)
+    // Note: We need a new scan executor because the old one is consumed
+    let scan_check = SeqScanExecutor::new(&catalog, table_oid).unwrap(); // No bpm
+    let mut filter_check = FilterExecutor::new(Box::new(scan_check), |t| {
+        if let AttributeValue::U32(id) = t.values[0] {
+            id == 1
+        } else {
+            false
+        }
+    });
+
+    filter_check.init(); // No bpm
+    let updated_tuple = filter_check
+        .next(pinned_bp.as_mut())
+        .expect("Should find updated row"); // Pass bpm
+    assert_eq!(updated_tuple.values[1], AttributeValue::U32(200));
 }

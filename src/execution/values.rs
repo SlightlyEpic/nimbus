@@ -1,5 +1,7 @@
 use super::executor::Executor;
+use crate::storage::buffer::BufferPool;
 use crate::storage::heap::tuple::Tuple;
+use std::pin::Pin;
 
 /// Generates tuples from a static list (e.g., "VALUES (1), (2), (3)")
 pub struct ValuesExecutor {
@@ -18,7 +20,7 @@ impl Executor for ValuesExecutor {
         self.cursor = 0;
     }
 
-    fn next(&mut self) -> Option<Tuple> {
+    fn next(&mut self, _bpm: Pin<&mut BufferPool>) -> Option<Tuple> {
         if self.cursor < self.tuples.len() {
             let tuple = self.tuples[self.cursor].clone();
             self.cursor += 1;

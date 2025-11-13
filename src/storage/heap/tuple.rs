@@ -1,16 +1,24 @@
 use crate::rt_type::primitives::{AttributeKind, AttributeValue, TableType};
+use crate::storage::heap::row::RowId;
 use std::convert::TryInto;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Tuple {
     pub values: Vec<AttributeValue>,
+    pub rid: Option<RowId>,
 }
 
 impl Tuple {
     pub fn new(values: Vec<AttributeValue>) -> Self {
-        Self { values }
+        Self { values, rid: None }
     }
 
+    pub fn new_with_rid(values: Vec<AttributeValue>, rid: RowId) -> Self {
+        Self {
+            values,
+            rid: Some(rid),
+        }
+    }
     /// Serializes the tuple into a packed byte vector (Variable Length).
     pub fn to_bytes(&self, schema: &TableType) -> Result<Vec<u8>, String> {
         let mut buffer = Vec::new();
@@ -193,7 +201,7 @@ impl Tuple {
             values.push(val);
         }
 
-        Ok(Self { values })
+        Ok(Self { values, rid: None })
     }
 }
 

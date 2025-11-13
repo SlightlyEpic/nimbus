@@ -204,6 +204,37 @@ impl HeapFile {
 
         data
     }
+
+    pub fn delete(&mut self, mut bpm: Pin<&mut BufferPool>, rid: RowId) -> Result<(), HeapError> {
+        let page_id = rid.page_id();
+        let slot_num = rid.slot_num();
+
+        let frame = bpm
+            .as_mut()
+            .fetch_page(page_id)
+            .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
+        let frame_id = frame.fid();
+
+        let res = {
+            let mut page_view = frame.page_view();
+            if let page::base::Page::SlottedData(slotted) = &mut page_view {
+                slotted
+                    .mark_dead(slot_num as usize)
+                    .map_err(|_| HeapError::InvalidPage)
+            } else {
+                Err(HeapError::InvalidPage)
+            }
+        };
+
+        if res.is_ok() {
+            bpm.as_mut().mark_frame_dirty(frame_id);
+        }
+        bpm.as_mut()
+            .unpin_frame(frame_id)
+            .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
+
+        res
+    }
 }
 
 #[cfg(test)]

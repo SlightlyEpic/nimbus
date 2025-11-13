@@ -210,6 +210,17 @@ impl<'a> SlottedData<'a> {
 
         Ok(())
     }
+
+    pub fn mark_dead(&mut self, idx: usize) -> Result<(), errors::RemoveSlotError> {
+        if idx >= self.num_slots() as usize {
+            return Err(errors::RemoveSlotError::IndexOutOfBounds);
+        }
+
+        // Set size to 0 (Tombstone)
+        self.set_slot_size_unchecked(idx, 0);
+
+        Ok(())
+    }
 }
 
 pub mod errors {

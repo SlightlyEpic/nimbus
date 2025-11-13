@@ -1,5 +1,7 @@
 use super::executor::Executor;
+use crate::storage::buffer::BufferPool;
 use crate::storage::heap::tuple::Tuple;
+use std::pin::Pin;
 
 // Indices of the columns to keep (e.g., [0, 2] keeps the 1st and 3rd columns)
 pub struct ProjectionExecutor<'a> {
@@ -21,8 +23,8 @@ impl<'a> Executor for ProjectionExecutor<'a> {
         self.child.init();
     }
 
-    fn next(&mut self) -> Option<Tuple> {
-        if let Some(tuple) = self.child.next() {
+    fn next(&mut self, mut bpm: Pin<&mut BufferPool>) -> Option<Tuple> {
+        if let Some(tuple) = self.child.next(bpm.as_mut()) {
             let mut new_values = Vec::new();
 
             for &idx in &self.column_indices {

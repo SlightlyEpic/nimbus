@@ -1,6 +1,7 @@
 use crate::storage::bplus_tree::BPlusTree;
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::heap_file::HeapError;
+use crate::storage::heap::row::RowId;
 use crate::storage::page::base::DiskPage;
 use crate::storage::page::base::{Page, PageId};
 use std::pin::Pin;
@@ -22,14 +23,12 @@ impl<'a> HeapIterator<'a> {
     }
 
     /// Advances the iterator and returns the next tuple as bytes
-    pub fn next(&mut self) -> Option<Result<Vec<u8>, HeapError>> {
+    pub fn next(&mut self) -> Option<Result<(RowId, Vec<u8>), HeapError>> {
         loop {
-            // End of the linked list
             if self.current_page_id == 0 {
                 return None;
             }
 
-            // 1. Fetch the current page
             let frame_result = self.bpm.as_mut().fetch_page(self.current_page_id);
             if let Err(e) = frame_result {
                 return Some(Err(HeapError::FetchPage(format!("{:?}", e))));
@@ -40,48 +39,44 @@ impl<'a> HeapIterator<'a> {
 
             let mut next_page_id = 0;
             let mut found_data = None;
+            let mut found_slot_num = 0; // Track the slot number
 
-            // 2. Scope for Page View to ensure we drop the borrow before unpinning
             {
                 let mut page_view = frame.page_view();
 
                 if let Page::SlottedData(slotted) = &mut page_view {
                     let num_slots = slotted.num_slots();
 
-                    // 3. Iterate through slots in the current page
                     while self.current_slot_index < num_slots {
                         let idx = self.current_slot_index as usize;
                         self.current_slot_index += 1;
 
-                        // Check if the slot has valid data (not a tombstone)
                         if let Some(data) = slotted.slot_data(idx) {
                             found_data = Some(data.to_vec());
+                            found_slot_num = idx as u32; // Capture slot
                             break;
                         }
                     }
 
-                    // If we finished all slots, prepare to jump to the next page
                     if found_data.is_none() {
                         next_page_id = slotted.header().next_page_id();
                     }
                 } else {
-                    // We encountered a page that isn't a SlottedData page in the heap chain
                     let _ = self.bpm.as_mut().unpin_frame(frame_id);
                     return Some(Err(HeapError::InvalidPage));
                 }
             }
 
-            // 4. Always unpin the frame after reading
             if let Err(e) = self.bpm.as_mut().unpin_frame(frame_id) {
                 return Some(Err(HeapError::UnpinPage(format!("{:?}", e))));
             }
 
-            // 5. If we found data, return it
             if let Some(data) = found_data {
-                return Some(Ok(data));
+                // Construct RowId
+                let rid = RowId::new(self.current_page_id, found_slot_num);
+                return Some(Ok((rid, data)));
             }
 
-            // 6. Otherwise, advance to the next page and reset slot index
             self.current_page_id = next_page_id;
             self.current_slot_index = 0;
         }
@@ -210,12 +205,10 @@ impl<'a> BTreeIterator<'a> {
     /// Returns the next (Key, Value) pair in the tree.
     pub fn next(&mut self) -> Option<(Vec<u8>, u64)> {
         loop {
-            // 1. Check Validity
             if self.current_page_id == 0 {
                 return None;
             }
 
-            // 2. Fetch Current Leaf
             let frame_res = self.bpm.as_mut().fetch_page(self.current_page_id);
             if frame_res.is_err() {
                 return None;
@@ -226,37 +219,28 @@ impl<'a> BTreeIterator<'a> {
             let mut result = None;
             let mut jump_to_sibling = None;
 
-            // 3. Read Data
             {
                 let page_view = frame.page_view();
                 if let Page::BPlusLeaf(leaf) = page_view {
                     if self.current_idx < leaf.num_entries() {
-                        // Case A: Valid Entry in current page
                         let key = leaf.get_key_at(self.current_idx as usize).to_vec();
-
                         let val = leaf.get_value(&key).unwrap();
-
                         result = Some((key, val));
                         self.current_idx += 1;
                     } else {
-                        // Case B: Exhausted current page, move to sibling
                         if let Some(next_id) = leaf.next_sibling() {
                             jump_to_sibling = Some(next_id);
                         } else {
-                            // No sibling, End of Scan
                             self.current_page_id = 0;
                         }
                     }
                 } else {
-                    // Invalid Page Type (Should not happen in valid tree)
                     self.current_page_id = 0;
                 }
             }
 
-            // 4. Unpin
             self.bpm.as_mut().unpin_frame(frame_id).ok();
 
-            // 5. Handle Transition
             if let Some(res) = result {
                 return Some(res);
             }
@@ -264,7 +248,6 @@ impl<'a> BTreeIterator<'a> {
             if let Some(next_id) = jump_to_sibling {
                 self.current_page_id = next_id;
                 self.current_idx = 0;
-                // Loop continues to fetch the next page immediately
             } else if self.current_page_id == 0 {
                 return None;
             }
