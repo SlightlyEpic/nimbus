@@ -279,7 +279,7 @@ fn print_centered_header() {
         padding
     );
     println!(
-        "{}\x1B[1;36m║\x1B[0m     \x1B[1;33mA Simple OLTP Database\x1B[0m        \x1B[1;36m║\x1B[0m",
+        "{}\x1B[1;36m║\x1B[0m          \x1B[1;33mAn OLTP Database\x1B[0m             \x1B[1;36m║\x1B[0m",
         padding
     );
     println!(
