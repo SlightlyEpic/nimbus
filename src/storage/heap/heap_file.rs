@@ -6,7 +6,6 @@ use crate::storage::page::{
     base::DiskPage,
     base::{PageId, PageKind},
 };
-use crate::storage::transaction;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -92,13 +91,48 @@ impl HeapFile {
         let required_space =
             data.len() as u32 + page::slotted_data::SlottedData::SLOT_META_SIZE as u32;
 
-        // NOTE: The unstable directory search logic (reusable_page_id and pages_to_try loop)
-        // has been removed here to stabilize the critical path (Run 18 stabilization).
+        let mut insert_page_id = 0;
 
-        // 2. Try inserting into the LAST PAGE (original reliable path)
+        // --- A. Check Last Page (Prioritize last page in chain via direct fetch) ---
         if self.last_page_id != 0 {
-            let page_id = self.last_page_id;
-            let frame = bpm
+            let last_page_id = self.last_page_id;
+            let fetch_result = bpm.as_mut().fetch_page(last_page_id);
+
+            if let Ok(frame) = fetch_result {
+                let frame_id = frame.fid();
+                let page_view = frame.page_view();
+
+                let space = if let page::base::Page::SlottedData(slotted) = page_view {
+                    slotted.free_space()
+                } else {
+                    0 // Invalid page type
+                };
+
+                bpm.as_mut().unpin_frame(frame_id).ok(); // Unpin after reading space
+
+                if space >= required_space {
+                    insert_page_id = last_page_id;
+                }
+            }
+            // If fetch failed or page was full, insert_page_id remains 0
+        }
+
+        // --- B. Search Reusable Pages (Run 18 Logic) ---
+        if insert_page_id == 0 {
+            let (core, locator) = bpm.as_mut().get_core_and_locator();
+            let reusable_id_opt: Option<PageId> = locator
+                .find_page_with_space(required_space, core)
+                .map_err(|e| HeapError::FindSpace(format!("{:?}", e)))?; // Yields Option<PageId> or returns HeapError
+
+            if let Some(reusable_id) = reusable_id_opt {
+                insert_page_id = reusable_id;
+            }
+        }
+
+        // --- C. Execute Insert on Existing Page (Reusable Page or Last Page) ---
+        if insert_page_id != 0 {
+            let page_id = insert_page_id;
+            let frame = bpm // Re-fetch, pins it again for insertion
                 .as_mut()
                 .fetch_page(page_id)
                 .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
@@ -114,24 +148,23 @@ impl HeapFile {
                 }
             };
 
-            if let Ok(slot_num) = insert_result {
-                // SUCCESS: Update Directory (REQUIRED FOR RUN 18 BOOKKEEPING)
-                bpm.as_mut().mark_frame_dirty(frame_id);
+            let slot_num = insert_result.map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?;
 
-                let (core, locator) = bpm.as_mut().get_core_and_locator();
-                locator
-                    .update_page_free_space(page_id, new_free_space, core)
-                    .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
+            // Success: Update Directory and mark dirty
+            bpm.as_mut().mark_frame_dirty(frame_id);
 
-                bpm.as_mut().unpin_frame(frame_id).ok();
-                return Ok(RowId::new(page_id, slot_num as u32));
-            } else {
-                // FAILURE (Page Full): Unpin and continue to allocate
-                bpm.as_mut().unpin_frame(frame_id).ok();
-            }
+            let (core, locator) = bpm.as_mut().get_core_and_locator();
+            locator
+                .update_page_free_space(page_id, new_free_space, core)
+                .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
+
+            bpm.as_mut().unpin_frame(frame_id).ok();
+            return Ok(RowId::new(page_id, slot_num as u32));
         }
 
-        // 3. Allocate a new page (Fallback)
+        // --- D. ALLOCATION FALLBACK (New Page) ---
+
+        // Allocate a new page (Fallback - only reached if all existing pages are full)
         let new_page_id = page_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         let frame = bpm
@@ -195,7 +228,7 @@ impl HeapFile {
         }
         self.last_page_id = new_page_id;
 
-        // 6. Register new page in Directory (crucial for recycling!)
+        // 6. Register new page in Directory
         bpm.as_mut()
             .expand_directory_and_register(
                 new_page_id,
