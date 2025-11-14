@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.175"
+sqlparser = "0.45.0"
+rustyline = "14.0.0"
+tabled = "0.20"

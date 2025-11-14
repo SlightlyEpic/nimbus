@@ -1,5 +1,6 @@
 use crate::constants;
-use crate::storage::page::base::{self, DiskPage};
+use crate::storage::page::base::{self, DiskPage, PageId};
+use crate::storage::page::header::PageHeader;
 use std::num::NonZeroU64;
 
 // Stores the mapping from page_id -> file_offset
@@ -8,15 +9,17 @@ pub struct Directory<'a> {
     raw: &'a mut base::PageBuf,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct DirectoryEntry {
-    pub page_id: base::PageId,
-    pub file_offset: NonZeroU64,
-    pub free_space: u32,
+    pub page_id: base::PageId, // 4 bytes
+    pub file_offset: u64,      // 8 bytes (0 means invalid/NonZero)
+    pub free_space: u32,       // 4 bytes
 }
 
 impl<'a> DiskPage for Directory<'a> {
     const PAGE_KIND: u8 = base::PageKind::Directory as u8;
+    const DATA_START: usize = PageHeader::SIZE; // Data starts after the header
 
     fn raw(self: &Self) -> &[u8; constants::storage::PAGE_SIZE] {
         return &self.raw;
@@ -28,271 +31,187 @@ impl<'a> DiskPage for Directory<'a> {
 }
 
 impl<'a> Directory<'a> {
-    // === Memory layout ===
-    //   0..  1 -> Page Kind  (u8)         -|
-    //   4..  8 -> Free space (u32)         | Header (64 bytes)
-    //   8.. 16 -> Page Id    (u64)         |
-    //  16.. 64 -> Reserved for future use -|
-    //  64.. 72 -> Next directory page's page id (Option<NonZeroU64>) -|
-    //  72.. 74 -> # of entries (u16)                                  | (16 bytes)
-    //  74.. 80 -> Empty                                              -|
-    //  80.. 88 -> Page Id (NonZeroU64)     -|
-    //  88.. 96 -> File offset (NonZeroU64)  | Directory entries (32 bytes)
-    //  96..100 -> Free space (u32)          |
-    //  100..111 -> Empty                   -|
-    //  ...entries
+    // Bytes:   | +0        | +1        | +2        | +3        |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 0..31    |              PageHeader (32 bytes)            |
+    //          | (page_kind = Directory)                       |
+    //          | (num_entries = N)                             |
+    //          | (next_page_id = P)                            |
+    // ---------+-----------+-----------+-----------+-----------|
+    // 32..47   | Entry 0 (page_id: u32, offset: u64, free: u32)|
+    // ---------+-----------+-----------+-----------+-----------|
+    // 48..63   | Entry 1 (page_id: u32, offset: u64, free: u32)|
+    // ---------+-----------+-----------+-----------+-----------|
+    // ...      | (Entry array grows downwards)                 |
+    // ---------+-----------------------------------------------|
+    //          |          <<< FREE SPACE >>>                   |
+    // ---------+-----------------------------------------------|
+    // 4095     | (End of Page)                                 |
+    // ---------------------------------------------------------|
 
-    const ENTRY_SIZE: usize = 32;
+    pub const ENTRY_SIZE: usize = std::mem::size_of::<DirectoryEntry>(); // 16 bytes
 
-    // Notes:
-    // - Assumes 4K alignment for self.raw, might cause unexpected behaviour otherwise
-    // - If a directory page has a next page, it's entries are guaranteed to contain the offset for that page
-    // - Could add [#inline] to getters and setters. Look into it later.
-
-    pub const fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
-        let mut page = Self { raw };
-        page.set_page_kind(base::PageKind::Directory);
-        page.set_free_space(
-            constants::storage::PAGE_SIZE as u32
-            - 64 // header
-            - 16, // other fields
-        );
-
-        page
+    /// Creates a new Directory page view from a raw buffer.
+    pub fn new<'b: 'a>(raw: &'b mut base::PageBuf) -> Self {
+        Self { raw }
     }
 
     // === Direct Getters ===
 
-    pub const fn page_kind(&self) -> u8 {
-        self.raw[0]
+    /// Gets the PageId from the header.
+    pub fn page_id(&self) -> base::PageId {
+        self.header().page_id()
     }
 
-    pub const fn free_space(&self) -> u32 {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(4) as *const u32;
-            u32::from_le(*ptr)
-        }
+    /// Calculates the amount of free space.
+    pub fn free_space(&self) -> u32 {
+        let data_start = Self::DATA_START as u16;
+        let num_entries = self.num_entries() as u16;
+        let data_end = data_start + (num_entries * Self::ENTRY_SIZE as u16);
+        self.header().free_space(data_end)
     }
 
-    pub const fn page_id(&self) -> base::PageId {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(8) as *const u64;
-            let val = u64::from_le(*ptr);
-            base::PageId::new(val).unwrap()
-        }
+    /// Gets the PageId of the next directory page, if any.
+    pub fn next_directory_page_id(&self) -> Option<base::PageId> {
+        let id = self.header().next_page_id();
+        if id == 0 { None } else { Some(id) }
     }
 
-    pub const fn next_directory_page_id(&self) -> Option<base::PageId> {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(64) as *const u64;
-            let val = u64::from_le(*ptr);
-            base::PageId::new(val)
-        }
+    /// Gets the number of entries from the header.
+    pub fn num_entries(&self) -> u16 {
+        self.header().num_entries()
     }
 
-    pub const fn num_entries(&self) -> u16 {
-        unsafe {
-            let ptr = self.raw.as_ptr().add(72) as *const u16;
-            u16::from_le(*ptr)
-        }
+    /// Gets a pointer to the entry at the given index.
+    fn entry_ptr(&self, idx: usize) -> *const DirectoryEntry {
+        let base = Self::DATA_START + idx * Self::ENTRY_SIZE;
+        unsafe { self.raw.as_ptr().add(base) as *const DirectoryEntry }
     }
 
-    pub const fn entry_page_id(&self, idx: usize) -> Option<base::PageId> {
+    /// Gets a mutable pointer to the entry at the given index.
+    fn entry_ptr_mut(&mut self, idx: usize) -> *mut DirectoryEntry {
+        let base = Self::DATA_START + idx * Self::ENTRY_SIZE;
+        unsafe { self.raw.as_mut_ptr().add(base) as *mut DirectoryEntry }
+    }
+
+    pub fn entry_page_id(&self, idx: usize) -> Option<base::PageId> {
         if idx >= self.num_entries() as usize {
             return None;
         }
-        let base = 80 + idx * Self::ENTRY_SIZE;
-        unsafe {
-            let ptr = self.raw.as_ptr().add(base) as *const u64;
-            let val = u64::from_le(*ptr);
-            base::PageId::new(val)
-        }
+        unsafe { Some(PageId::from_le((*self.entry_ptr(idx)).page_id)) }
     }
 
-    pub const fn entry_file_offset(&self, idx: usize) -> Option<NonZeroU64> {
+    pub fn entry_file_offset(&self, idx: usize) -> Option<NonZeroU64> {
         if idx >= self.num_entries() as usize {
             return None;
         }
-        let base = 80 + idx * Self::ENTRY_SIZE + 8;
-        unsafe {
-            let ptr = self.raw.as_ptr().add(base) as *const u64;
-            let val = u64::from_le(*ptr);
-            NonZeroU64::new(val)
-        }
+        unsafe { NonZeroU64::new(u64::from_le((*self.entry_ptr(idx)).file_offset)) }
     }
 
-    pub const fn entry_free_space(&self, idx: usize) -> Option<u32> {
+    pub fn entry_free_space(&self, idx: usize) -> Option<u32> {
         if idx >= self.num_entries() as usize {
             return None;
         }
-        let base = 80 + idx * Self::ENTRY_SIZE + 16;
-        unsafe {
-            let ptr = self.raw.as_ptr().add(base) as *const u32;
-            Some(u32::from_le(*ptr))
-        }
+        unsafe { Some(u32::from_le((*self.entry_ptr(idx)).free_space)) }
     }
 
     // === Indirect Getters ===
 
-    pub const fn entry_at(&self, idx: usize) -> Option<DirectoryEntry> {
+    /// Gets a copy of the entry at the given index.
+    pub fn entry_at(&self, idx: usize) -> Option<DirectoryEntry> {
         if idx >= self.num_entries() as usize {
             return None;
         }
-        Some(DirectoryEntry {
-            page_id: self.entry_page_id(idx).unwrap(),
-            file_offset: self.entry_file_offset(idx).unwrap(),
-            free_space: self.entry_free_space(idx).unwrap(),
-        })
+        unsafe {
+            let entry = *self.entry_ptr(idx);
+            Some(DirectoryEntry {
+                page_id: PageId::from_le(entry.page_id),
+                file_offset: u64::from_le(entry.file_offset),
+                free_space: u32::from_le(entry.free_space),
+            })
+        }
     }
 
     // === Direct Setters ===
 
-    const fn set_page_kind(&mut self, kind: base::PageKind) {
-        self.raw[0] = kind as u8;
+    /// Sets the PageId in the header.
+    pub fn set_page_id(&mut self, id: base::PageId) {
+        self.header_mut().set_page_id(id);
     }
 
-    const fn set_free_space(&mut self, free: u32) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(4) as *mut u32;
-            *ptr = free.to_le();
+    /// Sets the PageId of the next directory page in the header.
+    pub fn set_next_directory_page_id(&mut self, id: Option<base::PageId>) {
+        self.header_mut().set_next_page_id(id.unwrap_or(0));
+    }
+
+    /// Sets the free space value for a given entry.
+    pub fn set_entry_free_space(&mut self, idx: usize, free: u32) {
+        if idx >= self.num_entries() as usize {
+            panic!("set_entry_free_space: index out of bounds");
         }
-    }
-
-    pub const fn set_page_id(&mut self, id: base::PageId) {
         unsafe {
-            let ptr = self.raw.as_mut_ptr().add(8) as *mut u64;
-            *ptr = id.get().to_le();
-        }
-    }
-
-    pub const fn set_next_directory_page_id(&mut self, id: NonZeroU64) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(64) as *mut u64;
-            *ptr = id.get().to_le();
-        }
-    }
-
-    const fn set_num_entries(&mut self, n: u16) {
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(72) as *mut u16;
-            *ptr = n.to_le();
-        }
-    }
-
-    const fn set_entry_page_id(&mut self, idx: usize, id: Option<base::PageId>) {
-        let base = 80 + idx * Self::ENTRY_SIZE;
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
-            *ptr = match id {
-                Some(nz_value) => nz_value.get().to_le(),
-                None => 0u64.to_le(),
-            }
-        }
-    }
-
-    const fn set_entry_file_offset(&mut self, idx: usize, offset: Option<NonZeroU64>) {
-        let base = 80 + idx * Self::ENTRY_SIZE + 8;
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(base) as *mut u64;
-            *ptr = match offset {
-                Some(nz_value) => nz_value.get().to_le(),
-                None => 0u64.to_le(),
-            }
-        }
-    }
-
-    const fn set_entry_free_space(&mut self, idx: usize, free: u32) {
-        let base = 80 + idx * Self::ENTRY_SIZE + 16;
-        unsafe {
-            let ptr = self.raw.as_mut_ptr().add(base) as *mut u32;
-            *ptr = free.to_le();
+            (*self.entry_ptr_mut(idx)).free_space = free.to_le();
         }
     }
 
     // === Indirect setters ===
 
-    pub const fn add_entry(&mut self, entry: DirectoryEntry) -> Result<(), errors::AddEntryError> {
-        let free_space = self.free_space();
-        if free_space < 32 {
+    /// Adds a new entry to the end of the entry list.
+    pub fn add_entry(&mut self, entry: DirectoryEntry) -> Result<(), errors::AddEntryError> {
+        if self.free_space() < Self::ENTRY_SIZE as u32 {
             return Err(errors::AddEntryError::InsufficientSpace);
         }
 
         let num_entries = self.num_entries();
-        self.set_num_entries(num_entries + 1);
-        self.set_free_space(free_space - Self::ENTRY_SIZE as u32);
 
-        self.set_entry_page_id(num_entries as usize, Some(entry.page_id));
-        self.set_entry_file_offset(num_entries as usize, Some(entry.file_offset));
-        self.set_entry_free_space(num_entries as usize, entry.free_space);
+        unsafe {
+            *self.entry_ptr_mut(num_entries as usize) = DirectoryEntry {
+                page_id: entry.page_id.to_le(),
+                file_offset: entry.file_offset.to_le(),
+                free_space: entry.free_space.to_le(),
+            };
+        }
 
+        self.header_mut().set_num_entries(num_entries + 1);
         Ok(())
     }
 
-    // Just zeroes out the memory region of an entry
-    const fn erase_entry(&mut self, idx: usize) {
-        let base = 80 + idx * Self::ENTRY_SIZE + 8;
-        assert!(
-            base + Self::ENTRY_SIZE <= self.raw.len(),
-            "Out of bounds erase"
-        );
-
+    /// Swaps the entry at `idx` with the last entry.
+    fn swap_entries(&mut self, idx: usize, last_idx: usize) {
+        assert!(idx < last_idx, "swap_entries: invalid indexes");
         unsafe {
-            std::ptr::write_bytes(self.raw.as_mut_ptr().add(base), 0, Self::ENTRY_SIZE);
+            let last_entry = *self.entry_ptr(last_idx);
+            *self.entry_ptr_mut(idx) = last_entry;
         }
     }
 
-    const fn swap_entries(&mut self, idx_a: usize, idx_b: usize) {
-        if idx_a == idx_b {
-            return;
-        }
-
-        let base_a = 80 + idx_a * Self::ENTRY_SIZE;
-        let base_b = 80 + idx_b * Self::ENTRY_SIZE;
-
-        assert!(
-            base_a + Self::ENTRY_SIZE <= self.raw.len(),
-            "Out of bounds swap A"
-        );
-        assert!(
-            base_b + Self::ENTRY_SIZE <= self.raw.len(),
-            "Out of bounds swap B"
-        );
-
-        unsafe {
-            let ptr_a = self.raw.as_mut_ptr().add(base_a);
-            let ptr_b = self.raw.as_mut_ptr().add(base_b);
-
-            let mut tmp = [0u8; Self::ENTRY_SIZE];
-            std::ptr::copy_nonoverlapping(ptr_a, tmp.as_mut_ptr(), Self::ENTRY_SIZE);
-            std::ptr::copy_nonoverlapping(ptr_b, ptr_a, Self::ENTRY_SIZE);
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), ptr_b, Self::ENTRY_SIZE);
-        }
-    }
-
-    pub const fn remove_entry_at(&mut self, idx: usize) -> Result<(), errors::RemoveEntryError> {
+    /// Removes an entry by swapping it with the last entry and decrementing the count.
+    pub fn remove_entry_at(&mut self, idx: usize) -> Result<(), errors::RemoveEntryError> {
         let num_entries = self.num_entries() as usize;
         if idx >= num_entries {
             return Err(errors::RemoveEntryError::IndexOutOfBounds);
         }
 
-        let free_space = self.free_space();
-        self.set_free_space(free_space + Self::ENTRY_SIZE as u32);
-        self.set_num_entries(num_entries as u16 - 1);
-
-        self.erase_entry(idx);
-        if idx != num_entries - 1 {
-            self.swap_entries(idx, num_entries - 1);
+        let last_idx = num_entries - 1;
+        if idx != last_idx {
+            // Swap with the last entry
+            self.swap_entries(idx, last_idx);
         }
 
+        // Just decrementing the count effectively removes the last slot.
+        // We don't bother zeroing out the old data.
+        self.header_mut().set_num_entries(last_idx as u16);
         Ok(())
     }
 }
 
 pub mod errors {
+    #[derive(Debug)]
     pub enum AddEntryError {
         InsufficientSpace,
     }
 
+    #[derive(Debug)]
     pub enum RemoveEntryError {
         IndexOutOfBounds,
     }

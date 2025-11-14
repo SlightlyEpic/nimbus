@@ -1,7 +1,7 @@
 use crate::{
     constants,
     storage::page::{
-        bplus_inner::BPlusInner, bplus_leaf::BPlusLeaf, directory::Directory,
+        bplus_inner::BPlusInner, bplus_leaf::BPlusLeaf, directory::Directory, header::PageHeader,
         slotted_data::SlottedData,
     },
 };
@@ -10,7 +10,8 @@ use std::num::NonZeroU64;
 pub type PageBuf = [u8; constants::storage::PAGE_SIZE];
 
 // #anchor-pagekind-values
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 pub enum PageKind {
     Invalid = 0,
     Directory = 1,
@@ -21,13 +22,25 @@ pub enum PageKind {
 
 pub trait DiskPage {
     const PAGE_KIND: u8;
+    const DATA_START: usize;
 
     fn raw(&self) -> &PageBuf;
     fn raw_mut(&mut self) -> &mut PageBuf;
+
+    /// Gets an immutable reference to the page's header.
+    fn header(&self) -> &PageHeader {
+        PageHeader::from_buf(self.raw())
+    }
+
+    /// Gets a mutable reference to the page's header.
+    fn header_mut(&mut self) -> &mut PageHeader {
+        PageHeader::from_buf_mut(self.raw_mut())
+    }
 }
 
-pub type PageId = NonZeroU64;
+pub type PageId = u32;
 
+/// A generic enum to view any page buffer as its correct page type.
 pub enum Page<'a> {
     Invalid(),
     Directory(Directory<'a>),
@@ -46,22 +59,46 @@ impl<'a> Page<'a> {
             Page::Invalid() => panic!("Cannot get raw() from Page::Invalid"),
         }
     }
-}
 
-pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
-    // MAGIC: ensure that these values match the assigned PageKind values (#anchor-pagekind-values)
-    match buf[0] {
-        1 => PageKind::Directory,
-        2 => PageKind::SlottedData,
-        3 => PageKind::BPlusInner,
-        4 => PageKind::BPlusLeaf,
-        _ => PageKind::Invalid,
+    pub fn header(&self) -> &PageHeader {
+        match self {
+            Page::Directory(page) => page.header(),
+            Page::SlottedData(page) => page.header(),
+            Page::BPlusInner(page) => page.header(),
+            Page::BPlusLeaf(page) => page.header(),
+            Page::Invalid() => panic!("Cannot get header() from Page::Invalid"),
+        }
+    }
+
+    pub fn header_mut(&mut self) -> &mut PageHeader {
+        match self {
+            Page::Directory(page) => page.header_mut(),
+            Page::SlottedData(page) => page.header_mut(),
+            Page::BPlusInner(page) => page.header_mut(),
+            Page::BPlusLeaf(page) => page.header_mut(),
+            Page::Invalid() => panic!("Cannot get header_mut() from Page::Invalid"),
+        }
+    }
+
+    pub fn raw_mut(&mut self) -> &mut PageBuf {
+        match self {
+            Page::Directory(page) => page.raw_mut(),
+            Page::SlottedData(page) => page.raw_mut(),
+            Page::BPlusInner(page) => page.raw_mut(),
+            Page::BPlusLeaf(page) => page.raw_mut(),
+            Page::Invalid() => panic!("Cannot get raw_mut() from Page::Invalid"),
+        }
     }
 }
 
-/// initializes the raw buf_page
-/// zeros out all the values except the pagekind
+/// Reads the page kind from a raw buffer using the PageHeader.
+pub fn page_kind_from_buf(buf: &PageBuf) -> PageKind {
+    PageHeader::from_buf(buf).page_kind()
+}
+
+/// Initializes a raw page buffer by setting its PageHeader.
+/// Note: The page_id is set to 0 (invalid) here.
+/// The BufferPool is responsible for setting the correct PageId.
 pub fn init_page_buf(buf: &mut PageBuf, kind: PageKind) {
-    buf.fill(0);
-    buf[0] = kind as u8;
+    PageHeader::from_buf_mut(buf).init(0, kind);
 }

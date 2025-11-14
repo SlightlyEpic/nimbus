@@ -5,3 +5,4 @@ pub mod page_locator;
 pub mod util;
 
 pub mod bplus_tree;
+pub mod heap;
