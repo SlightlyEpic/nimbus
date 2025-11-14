@@ -572,6 +572,116 @@ impl Catalog {
         Ok(index_oid)
     }
 
+    pub fn list_user_tables(&self) -> Vec<(u32, String)> {
+        let mut tables: Vec<(u32, String)> = self
+            .table_cache
+            .iter()
+            .filter(|(_, oid)| **oid >= 100)
+            .map(|(name, oid)| (*oid, name.clone()))
+            .collect();
+
+        tables.sort_by(|a, b| a.1.cmp(&b.1));
+        tables
+    }
+
+    pub fn drop_table(&mut self, table_name: &str) -> Result<(), String> {
+        // 1. Get table OID
+        let table_oid = self
+            .table_cache
+            .get(table_name)
+            .copied()
+            .ok_or(format!("Table '{}' not found", table_name))?;
+
+        // Prevent dropping system tables
+        if table_oid < 100 {
+            return Err("Cannot drop system tables".to_string());
+        }
+
+        let mut bp_guard = self.bp.lock().map_err(|_| "Lock poisoned")?;
+        let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+        // 2. Drop all indexes associated with this table
+        if let Some(index_oids) = self.table_indexes.get(&table_oid).cloned() {
+            for index_oid in index_oids {
+                // Get index name for deletion
+                let index_name = self
+                    .index_name_cache
+                    .iter()
+                    .find(|(_, oid)| **oid == index_oid) // Fixed: dereference oid twice
+                    .map(|(name, _)| name.clone());
+
+                if let Some(idx_name) = index_name {
+                    // Delete from system_indexes table
+                    let mut iter = HeapIterator::new(pinned_bp.as_mut(), SYSTEM_INDEXES_PAGE_ID);
+                    while let Some(Ok((rid, bytes))) = iter.next() {
+                        if let Ok(tuple) = Tuple::from_bytes(&bytes, &get_system_indexes_schema()) {
+                            if let AttributeValue::U32(oid) = tuple.values[0] {
+                                if oid == index_oid {
+                                    HeapFile::new(0, 0)
+                                        .delete(pinned_bp.as_mut(), rid)
+                                        .map_err(|e| {
+                                            format!("Failed to delete index metadata: {:?}", e)
+                                        })?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Remove from caches
+                    self.index_name_cache.remove(&idx_name);
+                    self.index_meta_cache.remove(&index_oid);
+                }
+            }
+        }
+
+        // 3. Delete column metadata from system_columns
+        let mut rids_to_delete = Vec::new();
+        {
+            let mut iter = HeapIterator::new(pinned_bp.as_mut(), SYSTEM_COLUMNS_PAGE_ID);
+            while let Some(Ok((rid, bytes))) = iter.next() {
+                if let Ok(tuple) = Tuple::from_bytes(&bytes, &get_system_columns_schema()) {
+                    if let AttributeValue::U32(tid) = tuple.values[0] {
+                        if tid == table_oid {
+                            rids_to_delete.push(rid);
+                        }
+                    }
+                }
+            }
+        }
+
+        for rid in rids_to_delete {
+            HeapFile::new(0, 0)
+                .delete(pinned_bp.as_mut(), rid)
+                .map_err(|e| format!("Failed to delete column metadata: {:?}", e))?;
+        }
+
+        // 4. Delete table metadata from system_tables
+        {
+            let mut iter = HeapIterator::new(pinned_bp.as_mut(), SYSTEM_TABLES_PAGE_ID);
+            while let Some(Ok((rid, bytes))) = iter.next() {
+                if let Ok(tuple) = Tuple::from_bytes(&bytes, &get_system_tables_schema()) {
+                    if let AttributeValue::U32(oid) = tuple.values[0] {
+                        if oid == table_oid {
+                            HeapFile::new(0, 0)
+                                .delete(pinned_bp.as_mut(), rid)
+                                .map_err(|e| format!("Failed to delete table metadata: {:?}", e))?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Remove from runtime caches
+        self.table_cache.remove(table_name);
+        self.schema_cache.remove(&table_oid);
+        self.root_page_cache.remove(&table_oid);
+        self.table_indexes.remove(&table_oid);
+
+        Ok(())
+    }
+
     pub fn insert_tuple(
         &self,
         table_oid: u32,

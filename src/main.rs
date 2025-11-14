@@ -14,35 +14,24 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use nimbus::cli;
+use tabled::{builder::Builder, settings::Style};
 
 fn main() {
-    // Clear screen at startup
     print!("\x1B[2J\x1B[1;1H");
-
-    // Print beautiful centered header with colors
     print_centered_header();
 
-    let db_name = "nimbus.db";
+    let default_db = "nimbus.db";
     let _ = fs::create_dir_all("test_db");
-    let file_path = format!("test_db/{}", db_name);
+    let mut current_db_path = format!("test_db/{}", default_db);
 
-    let fm = FileManager::new(file_path.clone()).unwrap();
-    let bp = Arc::new(Mutex::new(BufferPool::new(
-        fm,
-        Box::new(FifoEvictor::new()),
-        Box::new(DirectoryPageLocator::new()),
-    )));
-
-    let mut catalog = Catalog::new(bp.clone());
+    let (mut bp, mut catalog) = init_database(current_db_path.clone());
     let mut rl = DefaultEditor::new().unwrap();
 
     loop {
-        // --- 1. Read and Parse Input ---
         let ast = match rl.readline("nimbus> ") {
             Ok(line) => {
                 let trimmed = line.trim();
 
-                // Handle special commands
                 if trimmed == ".exit" {
                     println!("\n\x1B[1;32mGoodbye!\x1B[0m\n");
                     break;
@@ -50,6 +39,17 @@ fn main() {
 
                 if trimmed == ".help" {
                     print_help();
+                    continue;
+                }
+
+                if trimmed == ".clear" {
+                    print!("\x1B[2J\x1B[1;1H");
+                    print_centered_header();
+                    continue;
+                }
+
+                if trimmed == ".tables" {
+                    show_tables(&catalog);
                     continue;
                 }
 
@@ -72,7 +72,7 @@ fn main() {
                 match parser::parse(&line) {
                     Ok(ast) => ast,
                     Err(e) => {
-                        println!("\x1B[1;31m✗ Parse Error:\x1B[0m {}", e);
+                        println!("\x1B[1;31mParse Error:\x1B[0m {}", e);
                         continue;
                     }
                 }
@@ -86,13 +86,34 @@ fn main() {
                 break;
             }
             Err(err) => {
-                println!("\x1B[1;31m✗ Error:\x1B[0m {:?}", err);
+                println!("\x1B[1;31mError:\x1B[0m {:?}", err);
                 break;
             }
         };
 
-        // --- 2. Handle DDL and DML operations ---
         match ast {
+            parser::AstStatement::Clear => {
+                print!("\x1B[2J\x1B[1;1H");
+                print_centered_header();
+            }
+            parser::AstStatement::ShowTables => {
+                show_tables(&catalog);
+            }
+            parser::AstStatement::DropTable { table_name } => {
+                match catalog.drop_table(&table_name) {
+                    Ok(_) => println!(
+                        "\x1B[1;32mTable '{}' dropped successfully\x1B[0m",
+                        table_name
+                    ),
+                    Err(e) => println!("\x1B[1;31mError:\x1B[0m {}", e),
+                }
+            }
+            parser::AstStatement::UseDatabase { path } => {
+                match use_database(path.clone(), &mut bp, &mut catalog, &mut current_db_path) {
+                    Ok(_) => println!("\x1B[1;32mSwitched to database: {}\x1B[0m", path),
+                    Err(e) => println!("\x1B[1;31mError:\x1B[0m {}", e),
+                }
+            }
             parser::AstStatement::CreateTable {
                 table_name,
                 columns,
@@ -120,8 +141,8 @@ fn main() {
                 };
 
                 match catalog.create_table(&table_name, schema) {
-                    Ok(_) => println!("\x1B[1;32m✓ Table '{}' created\x1B[0m", table_name),
-                    Err(e) => println!("\x1B[1;31m✗ Error:\x1B[0m {}", e),
+                    Ok(_) => println!("\x1B[1;32mTable '{}' created\x1B[0m", table_name),
+                    Err(e) => println!("\x1B[1;31mError:\x1B[0m {}", e),
                 }
             }
             parser::AstStatement::CreateIndex {
@@ -130,28 +151,92 @@ fn main() {
                 column_name,
             } => match catalog.create_index(&index_name, &table_name, &column_name) {
                 Ok(_) => println!(
-                    "\x1B[1;32m✓ Index '{}' created on {}.{}\x1B[0m",
+                    "\x1B[1;32mIndex '{}' created on {}.{}\x1B[0m",
                     index_name, table_name, column_name
                 ),
-                Err(e) => println!("\x1B[1;31m✗ Error:\x1B[0m {}", e),
+                Err(e) => println!("\x1B[1;31mError:\x1B[0m {}", e),
             },
             other => {
-                // DML Execution - handle in separate scope to avoid borrow conflicts
                 execute_dml_query(&catalog, &bp, other);
             }
         }
     }
 
-    // Graceful shutdown
     println!("\x1B[1;34mFlushing data to disk...\x1B[0m");
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
     pinned_bp.flush_all().expect("Failed to flush all pages.");
-    println!("\x1B[1;32m✓ All data flushed to {}.\x1B[0m", file_path);
+    println!("\x1B[1;32mAll data flushed to {}.\x1B[0m", current_db_path);
 }
 
-/// Execute DML queries (SELECT, INSERT, UPDATE, DELETE)
-/// This is in a separate function to ensure catalog borrow is scoped properly
+fn init_database(path: String) -> (Arc<Mutex<BufferPool>>, Catalog) {
+    let fm = FileManager::new(path.clone()).unwrap();
+    let bp = Arc::new(Mutex::new(BufferPool::new(
+        fm,
+        Box::new(FifoEvictor::new()),
+        Box::new(DirectoryPageLocator::new()),
+    )));
+    let catalog = Catalog::new(bp.clone());
+    (bp, catalog)
+}
+
+fn use_database(
+    path: String,
+    bp: &mut Arc<Mutex<BufferPool>>,
+    catalog: &mut Catalog,
+    current_path: &mut String,
+) -> Result<(), String> {
+    let full_path = if path.starts_with('/') || path.contains(':') {
+        path.clone()
+    } else {
+        format!("test_db/{}", path)
+    };
+
+    if let Some(parent) = std::path::Path::new(&full_path).parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    {
+        let mut bp_guard = bp.lock().map_err(|_| "Lock poisoned")?;
+        let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+        pinned_bp
+            .flush_all()
+            .map_err(|e| format!("Failed to flush: {:?}", e))?;
+    }
+
+    let (new_bp, new_catalog) = init_database(full_path.clone());
+    *bp = new_bp;
+    *catalog = new_catalog;
+    *current_path = full_path;
+
+    Ok(())
+}
+
+fn show_tables(catalog: &Catalog) {
+    let tables = catalog.list_user_tables();
+
+    if tables.is_empty() {
+        println!("\n\x1B[1;33mNo tables found\x1B[0m\n");
+        return;
+    }
+
+    let mut table_builder = Builder::default();
+    table_builder.push_record(vec!["OID", "Table Name"]);
+
+    for (oid, name) in &tables {
+        table_builder.push_record(vec![oid.to_string(), name.clone()]);
+    }
+
+    let mut table = table_builder.build();
+    table.with(Style::rounded());
+    println!("\n{}", table.to_string());
+    println!(
+        "\x1B[1;36m{} table{} found\x1B[0m\n",
+        tables.len(),
+        if tables.len() == 1 { "" } else { "s" }
+    );
+}
+
 fn execute_dml_query<'a>(
     catalog: &'a Catalog,
     bp: &Arc<Mutex<BufferPool>>,
@@ -162,7 +247,7 @@ fn execute_dml_query<'a>(
     let plan = match planner.plan(ast.clone()) {
         Ok(plan) => plan,
         Err(e) => {
-            println!("\x1B[1;31m✗ Plan Error:\x1B[0m {}", e);
+            println!("\x1B[1;31mPlan Error:\x1B[0m {}", e);
             return;
         }
     };
@@ -173,12 +258,10 @@ fn execute_dml_query<'a>(
     cli::display_query_result(plan, &ast, catalog, pinned_bp.as_mut());
 }
 
-/// Print centered header
 fn print_centered_header() {
-    // Simple centering - assume 80 column terminal as default
-    let padding = "                   "; // 19 spaces for ~80 char centering
+    let padding = "                   ";
 
-    println!(); // Empty line at top
+    println!();
     println!(
         "{}\x1B[1;36m╔═══════════════════════════════════════╗\x1B[0m",
         padding
@@ -208,15 +291,13 @@ fn print_centered_header() {
         padding
     );
 
-    // Print help hint centered
-    let hint_padding = "          "; // Centered hint
+    let hint_padding = "          ";
     println!(
         "{}\x1B[1;32mType '.help' for commands or '.exit' to quit\x1B[0m\n",
         hint_padding
     );
 }
 
-/// Print help information
 fn print_help() {
     println!("\n\x1B[1;35m═══════════════════════════════════════════════════════════════\x1B[0m");
     println!(
@@ -227,12 +308,19 @@ fn print_help() {
     println!("\x1B[1;36mSpecial Commands:\x1B[0m");
     println!("  \x1B[1;33m.help\x1B[0m                    Show this help message");
     println!("  \x1B[1;33m.exit\x1B[0m                    Exit NimbusDB");
+    println!("  \x1B[1;33m.clear\x1B[0m                   Clear terminal screen");
+    println!("  \x1B[1;33m.tables\x1B[0m                  List all tables");
     println!("  \x1B[1;33m.describe <table>\x1B[0m        Show table structure");
     println!("  \x1B[1;33m.desc <table>\x1B[0m            Short form of .describe\n");
 
     println!("\x1B[1;36mSQL Statements:\x1B[0m");
+    println!("  \x1B[1;33mSHOW TABLES\x1B[0m              List all tables");
+    println!();
     println!("  \x1B[1;33mCREATE TABLE\x1B[0m             Create a new table");
     println!("    \x1B[2mExample: CREATE TABLE users (id INT, name VARCHAR);\x1B[0m");
+    println!();
+    println!("  \x1B[1;33mDROP TABLE\x1B[0m               Delete a table and its indexes");
+    println!("    \x1B[2mExample: DROP TABLE users;\x1B[0m");
     println!();
     println!("  \x1B[1;33mCREATE INDEX\x1B[0m             Create an index on a column");
     println!("    \x1B[2mExample: CREATE INDEX idx_id ON users(id);\x1B[0m");
@@ -253,7 +341,6 @@ fn print_help() {
     println!("\x1B[1;35m═══════════════════════════════════════════════════════════════\x1B[0m\n");
 }
 
-/// Describe table structure
 fn describe_table(catalog: &Catalog, table_name: &str) {
     match catalog.get_table_oid(table_name) {
         Some(oid) => match catalog.get_table_schema(oid) {
@@ -294,13 +381,10 @@ fn describe_table(catalog: &Catalog, table_name: &str) {
                 println!("{}\n", table);
             }
             None => println!(
-                "\x1B[1;31m✗ Error:\x1B[0m Schema not found for table '{}'\n",
+                "\x1B[1;31mError:\x1B[0m Schema not found for table '{}'\n",
                 table_name
             ),
         },
-        None => println!(
-            "\x1B[1;31m✗ Error:\x1B[0m Table '{}' not found\n",
-            table_name
-        ),
+        None => println!("\x1B[1;31mError:\x1B[0m Table '{}' not found\n", table_name),
     }
 }

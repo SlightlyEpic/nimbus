@@ -34,6 +34,14 @@ pub enum AstStatement {
         table_name: String,
         column_name: String,
     },
+    ShowTables,
+    DropTable {
+        table_name: String,
+    },
+    Clear,
+    UseDatabase {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +56,17 @@ pub enum AstDataType {
     Varchar,
 }
 
-/// Parses a SQL string into our simplified AST.
 pub fn parse(sql: &str) -> Result<AstStatement, String> {
+    let trimmed = sql.trim();
+
+    if trimmed.eq_ignore_ascii_case(".clear") {
+        return Ok(AstStatement::Clear);
+    }
+
+    if trimmed.eq_ignore_ascii_case(".tables") || trimmed.eq_ignore_ascii_case("show tables") {
+        return Ok(AstStatement::ShowTables);
+    }
+
     let dialect = GenericDialect {};
     let mut ast = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
 
@@ -58,12 +75,34 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
     }
 
     match ast.remove(0) {
+        Statement::Drop {
+            object_type, names, ..
+        } => {
+            use sqlparser::ast::ObjectType;
+            match object_type {
+                ObjectType::Table => {
+                    let table_name = names
+                        .first()
+                        .and_then(|obj_name| obj_name.0.get(0))
+                        .map(|ident| ident.value.clone())
+                        .ok_or("DROP TABLE requires a table name")?;
+                    Ok(AstStatement::DropTable { table_name })
+                }
+                _ => Err("Only DROP TABLE is supported".to_string()),
+            }
+        }
+        Statement::Use { db_name } => {
+            let path = db_name.value;
+            Ok(AstStatement::UseDatabase { path })
+        }
+
         Statement::Insert {
             table_name,
             columns,
             source,
             ..
         } => {
+            // existing INSERT logic
             let table = table_name.0.get(0).unwrap().value.clone();
             let cols = columns
                 .into_iter()
@@ -94,6 +133,7 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
                 Err("Unsupported INSERT source (must be VALUES)".to_string())
             }
         }
+        // Keep all existing Statement matches (Query, Update, Delete, CreateTable, CreateIndex)
         Statement::Query(query) => {
             if let SetExpr::Select(select) = *query.body {
                 let table_name = if let Some(table) = select.from.get(0) {
@@ -156,7 +196,6 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
         Statement::Delete {
             from, selection, ..
         } => {
-            // Handle DELETE statement - 'from' is FromTable enum
             use sqlparser::ast::FromTable;
 
             let table_name = match from {

@@ -48,6 +48,14 @@ impl<'a> Planner<'a> {
             AstStatement::CreateIndex { .. } => {
                 Err("CREATE INDEX not supported in query plan".to_string())
             }
+            AstStatement::ShowTables => Err("SHOW TABLES not supported in query plan".to_string()),
+            AstStatement::DropTable { .. } => {
+                Err("DROP TABLE not supported in query plan".to_string())
+            }
+            AstStatement::Clear => Err("CLEAR not supported in query plan".to_string()),
+            AstStatement::UseDatabase { .. } => {
+                Err("USE DATABASE not supported in query plan".to_string())
+            }
         }
     }
 
