@@ -177,23 +177,55 @@ impl Tuple {
 
                 // --- Strings ---
                 AttributeKind::Char(len) => {
+                    let fixed_block_size = len + 1; // 1 byte for length + max data size
+
+                    // 1. Fixed Block Bounds Check
+                    if cursor + fixed_block_size > data.len() {
+                        return Err("Buffer overrun reading Char".to_string());
+                    }
+
+                    // 2. Read string length
                     let str_len = data[cursor] as usize;
-                    cursor += 1;
-                    let s = String::from_utf8(data[cursor..cursor + str_len].to_vec())
+                    if str_len > len {
+                        return Err("Corrupted Char length".to_string());
+                    }
+
+                    // 3. Read string content
+                    let s = String::from_utf8(data[cursor + 1..cursor + 1 + str_len].to_vec())
                         .map_err(|_| "Invalid UTF8")?;
-                    cursor += len;
+
+                    // 4. Advance cursor by the full fixed size, skipping padding (Fix 2)
+                    cursor += fixed_block_size;
+
                     AttributeValue::Char(s)
                 }
-                AttributeKind::Varchar => {
-                    let len_bytes = data[cursor..cursor + 2]
-                        .try_into()
-                        .map_err(|_| "Read err")?;
-                    let str_len = u16::from_be_bytes(len_bytes) as usize;
-                    cursor += 2;
 
-                    let s = String::from_utf8(data[cursor..cursor + str_len].to_vec())
+                AttributeKind::Varchar => {
+                    // 1. Read Length Prefix (2 bytes)
+                    let len_end = cursor + 2;
+                    if len_end > data.len() {
+                        return Err("Buffer overrun reading Varchar length prefix".to_string());
+                    }
+                    let len_bytes = data[cursor..len_end].try_into().map_err(|_| "Read err")?;
+                    let str_len = u16::from_be_bytes(len_bytes) as usize;
+
+                    // 2. Total Data Bounds Check (Fix 1)
+                    let data_end = len_end + str_len;
+                    if data_end > data.len() {
+                        return Err(format!(
+                            "Buffer overrun reading Varchar data (expected {}, got {})",
+                            data_end,
+                            data.len()
+                        ));
+                    }
+
+                    // 3. Read and Deserialize String
+                    let s = String::from_utf8(data[len_end..data_end].to_vec())
                         .map_err(|_| "Invalid UTF8")?;
-                    cursor += str_len;
+
+                    // 4. Advance cursor
+                    cursor = data_end;
+
                     AttributeValue::Varchar(s)
                 }
                 _ => return Err("Unsupported type deserialization".to_string()),

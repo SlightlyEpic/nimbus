@@ -1,6 +1,7 @@
 use crate::constants;
 use crate::storage::page::base::DiskPage;
 use crate::storage::page::{base, header::PageHeader};
+pub const SLOT_META_SIZE: usize = 4;
 
 pub struct SlottedData<'a> {
     raw: &'a mut base::PageBuf,

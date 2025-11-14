@@ -6,6 +6,7 @@ use crate::storage::page::{
     base::DiskPage,
     base::{PageId, PageKind},
 };
+use crate::storage::transaction;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -37,132 +38,6 @@ impl HeapFile {
 
     pub fn scan<'a>(&self, bpm: Pin<&'a mut BufferPool>) -> HeapIterator<'a> {
         HeapIterator::new(bpm, self.first_page_id)
-    }
-
-    /// Inserts raw byte data into the heap file.
-    /// Enforces isolation: Only attempts to insert into this specific heap's chain.
-    pub fn insert(
-        &mut self,
-        mut bpm: Pin<&mut BufferPool>,
-        page_id_counter: &AtomicU32,
-        data: &[u8],
-    ) -> Result<RowId, HeapError> {
-        // 1. Try to insert into the last page of this specific heap
-        if self.last_page_id != 0 {
-            let frame = bpm
-                .as_mut()
-                .fetch_page(self.last_page_id)
-                .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
-            let frame_id = frame.fid();
-
-            // Attempt insert
-            let insert_result = {
-                let mut page_view = frame.page_view();
-                if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
-                    slotted_page.add_slot(data)
-                } else {
-                    bpm.as_mut().unpin_frame(frame_id).ok();
-                    return Err(HeapError::InvalidPage);
-                }
-            };
-
-            if let Ok(slot_num) = insert_result {
-                // Success!
-                bpm.as_mut().mark_frame_dirty(frame_id);
-                bpm.as_mut()
-                    .unpin_frame(frame_id)
-                    .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
-
-                // We don't strictly need to update the global directory's free space
-                // immediately for correctness, but it's good practice.
-                // For now, we skip it to keep logic simple and isolated.
-
-                return Ok(RowId::new(self.last_page_id, slot_num as u32));
-            } else {
-                // Page is full (or error), unpin and continue to allocate new page
-                bpm.as_mut()
-                    .unpin_frame(frame_id)
-                    .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
-            }
-        }
-
-        // 2. Allocate a new page (Page is full or heap is empty)
-        let new_page_id = page_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
-        let frame = bpm
-            .as_mut()
-            .alloc_new_page(PageKind::SlottedData, new_page_id)
-            .map_err(|e| HeapError::AllocPage(format!("{:?}", e)))?;
-
-        let new_frame_id = frame.fid();
-        let new_file_offset = frame.file_offset();
-
-        // Init and Insert
-        let slot_num = {
-            let mut page_view = frame.page_view();
-            if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
-                slotted_page.header_mut().set_page_id(new_page_id);
-
-                // Link backwards
-                if self.last_page_id != 0 {
-                    slotted_page
-                        .header_mut()
-                        .set_prev_page_id(self.last_page_id);
-                }
-
-                slotted_page
-                    .add_slot(data)
-                    .map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?
-            } else {
-                bpm.as_mut().unpin_frame(new_frame_id).ok();
-                return Err(HeapError::InvalidPage);
-            }
-        };
-
-        bpm.as_mut().mark_frame_dirty(new_frame_id);
-        bpm.as_mut()
-            .unpin_frame(new_frame_id)
-            .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
-
-        // 3. Link forward (Update old last page)
-        if self.last_page_id != 0 {
-            let prev_frame = bpm
-                .as_mut()
-                .fetch_page(self.last_page_id)
-                .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
-            let prev_fid = prev_frame.fid();
-
-            {
-                let mut prev_view = prev_frame.page_view();
-                prev_view.header_mut().set_next_page_id(new_page_id);
-            }
-
-            bpm.as_mut().mark_frame_dirty(prev_fid);
-            bpm.as_mut()
-                .unpin_frame(prev_fid)
-                .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
-        }
-
-        // 4. Update HeapFile state
-        if self.first_page_id == 0 {
-            self.first_page_id = new_page_id;
-        }
-        self.last_page_id = new_page_id;
-
-        // 5. Register new page in Directory (so we can find it later via PageID)
-        // We calculate free space roughly
-        let free_space = 4000; // Safe approximation for new page
-
-        bpm.as_mut()
-            .expand_directory_and_register(
-                new_page_id,
-                new_file_offset,
-                free_space,
-                page_id_counter,
-            )
-            .map_err(|e| HeapError::RegisterPage(e))?;
-
-        Ok(RowId::new(new_page_id, slot_num as u32))
     }
 
     pub fn get(mut bpm: Pin<&mut BufferPool>, rid: RowId) -> Result<Vec<u8>, HeapError> {
@@ -205,6 +80,135 @@ impl HeapFile {
         data
     }
 
+    // src/storage/heap/heap_file.rs
+
+    pub fn insert(
+        &mut self,
+        mut bpm: Pin<&mut BufferPool>,
+        page_id_counter: &AtomicU32,
+        data: &[u8],
+    ) -> Result<RowId, HeapError> {
+        // 1. Calculate Required Space
+        let required_space =
+            data.len() as u32 + page::slotted_data::SlottedData::SLOT_META_SIZE as u32;
+
+        // NOTE: The unstable directory search logic (reusable_page_id and pages_to_try loop)
+        // has been removed here to stabilize the critical path (Run 18 stabilization).
+
+        // 2. Try inserting into the LAST PAGE (original reliable path)
+        if self.last_page_id != 0 {
+            let page_id = self.last_page_id;
+            let frame = bpm
+                .as_mut()
+                .fetch_page(page_id)
+                .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
+            let frame_id = frame.fid();
+
+            let (insert_result, new_free_space) = {
+                let mut page_view = frame.page_view();
+                if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
+                    (slotted_page.add_slot(data), slotted_page.free_space())
+                } else {
+                    bpm.as_mut().unpin_frame(frame_id).ok();
+                    return Err(HeapError::InvalidPage);
+                }
+            };
+
+            if let Ok(slot_num) = insert_result {
+                // SUCCESS: Update Directory (REQUIRED FOR RUN 18 BOOKKEEPING)
+                bpm.as_mut().mark_frame_dirty(frame_id);
+
+                let (core, locator) = bpm.as_mut().get_core_and_locator();
+                locator
+                    .update_page_free_space(page_id, new_free_space, core)
+                    .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
+
+                bpm.as_mut().unpin_frame(frame_id).ok();
+                return Ok(RowId::new(page_id, slot_num as u32));
+            } else {
+                // FAILURE (Page Full): Unpin and continue to allocate
+                bpm.as_mut().unpin_frame(frame_id).ok();
+            }
+        }
+
+        // 3. Allocate a new page (Fallback)
+        let new_page_id = page_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let frame = bpm
+            .as_mut()
+            .alloc_new_page(PageKind::SlottedData, new_page_id)
+            .map_err(|e| HeapError::AllocPage(format!("{:?}", e)))?;
+
+        let new_frame_id = frame.fid();
+        let new_file_offset = frame.file_offset();
+
+        // Init and Insert
+        let (slot_num, new_free_space) = {
+            let mut page_view = frame.page_view();
+            if let page::base::Page::SlottedData(slotted_page) = &mut page_view {
+                slotted_page.header_mut().set_page_id(new_page_id);
+
+                // Link backwards
+                if self.last_page_id != 0 {
+                    slotted_page
+                        .header_mut()
+                        .set_prev_page_id(self.last_page_id);
+                }
+
+                let slot_num = slotted_page
+                    .add_slot(data)
+                    .map_err(|e| HeapError::AddSlot(format!("{:?}", e)))?;
+                (slot_num, slotted_page.free_space())
+            } else {
+                bpm.as_mut().unpin_frame(new_frame_id).ok();
+                return Err(HeapError::InvalidPage);
+            }
+        };
+
+        bpm.as_mut().mark_frame_dirty(new_frame_id);
+        bpm.as_mut()
+            .unpin_frame(new_frame_id)
+            .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
+
+        // 4. Link forward (Update old last page)
+        if self.last_page_id != 0 {
+            let prev_frame = bpm
+                .as_mut()
+                .fetch_page(self.last_page_id)
+                .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
+            let prev_fid = prev_frame.fid();
+
+            {
+                let mut prev_view = prev_frame.page_view();
+                prev_view.header_mut().set_next_page_id(new_page_id);
+            }
+
+            bpm.as_mut().mark_frame_dirty(prev_fid);
+            bpm.as_mut()
+                .unpin_frame(prev_fid)
+                .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
+        }
+
+        // 5. Update HeapFile state
+        if self.first_page_id == 0 {
+            self.first_page_id = new_page_id;
+        }
+        self.last_page_id = new_page_id;
+
+        // 6. Register new page in Directory (crucial for recycling!)
+        bpm.as_mut()
+            .expand_directory_and_register(
+                new_page_id,
+                new_file_offset,
+                new_free_space,
+                page_id_counter,
+            )
+            .map_err(|e| HeapError::RegisterPage(e))?;
+
+        Ok(RowId::new(new_page_id, slot_num as u32))
+    }
+
+    // --- HeapFile::delete update to include Directory update ---
     pub fn delete(&mut self, mut bpm: Pin<&mut BufferPool>, rid: RowId) -> Result<(), HeapError> {
         let page_id = rid.page_id();
         let slot_num = rid.slot_num();
@@ -215,20 +219,30 @@ impl HeapFile {
             .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
         let frame_id = frame.fid();
 
-        let res = {
+        let (res, new_free_space) = {
             let mut page_view = frame.page_view();
             if let page::base::Page::SlottedData(slotted) = &mut page_view {
-                slotted
-                    .mark_dead(slot_num as usize)
-                    .map_err(|_| HeapError::InvalidPage)
+                let result = slotted
+                    .mark_dead(slot_num as usize) // Mark slot dead (tombstone)
+                    .map_err(|_| HeapError::InvalidPage);
+                (result, slotted.free_space())
             } else {
-                Err(HeapError::InvalidPage)
+                (Err(HeapError::InvalidPage), 0)
             }
         };
 
         if res.is_ok() {
+            // 1. Mark Dirty
             bpm.as_mut().mark_frame_dirty(frame_id);
+
+            // 2. Update Directory (New Step: makes space available for reuse)
+            let (core, locator) = bpm.as_mut().get_core_and_locator();
+            locator
+                .update_page_free_space(page_id, new_free_space, core)
+                .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
         }
+
+        // 3. Unpin
         bpm.as_mut()
             .unpin_frame(frame_id)
             .map_err(|e| HeapError::UnpinPage(format!("{:?}", e)))?;
