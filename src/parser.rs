@@ -102,7 +102,6 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
             source,
             ..
         } => {
-            // existing INSERT logic
             let table = table_name.0.get(0).unwrap().value.clone();
             let cols = columns
                 .into_iter()

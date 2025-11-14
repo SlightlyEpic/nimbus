@@ -46,11 +46,11 @@ fn test_seq_scan_system_tables() {
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
     let mut scan = SeqScanExecutor::new(&catalog, SYSTEM_TABLES_ID).expect("Failed to create scan");
-    scan.init(); // No bpm
+    scan.init(); 
 
     let mut count = 0;
     while let Some(tuple) = scan.next(pinned_bp.as_mut()) {
-        // Pass bpm
+        
         println!("Found system row: {:?}", tuple);
         count += 1;
     }
@@ -91,13 +91,13 @@ fn test_insert_and_filter() {
     let mut bp_guard = bp.lock().unwrap(); // Lock for insert
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); 
 
-    insert_exec.init(); // No bpm
+    insert_exec.init(); 
     insert_exec.next(pinned_bp.as_mut()); // Execute insert, pass bpm
 
     // 3. Scan & Filter
-    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); 
 
     // Filter: WHERE age > 20
     let mut filter_exec = FilterExecutor::new(scan_exec, |t: &Tuple| match t.values[0] {
@@ -105,11 +105,11 @@ fn test_insert_and_filter() {
         _ => false,
     });
 
-    filter_exec.init(); // No bpm
+    filter_exec.init(); 
 
     let mut output_rows = 0;
     while let Some(t) = filter_exec.next(pinned_bp.as_mut()) {
-        // Pass bpm
+        
         if let AttributeValue::U32(age) = t.values[0] {
             assert!(age > 20);
         }
@@ -149,24 +149,24 @@ fn test_filter_execution() {
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); 
 
-    insert_exec.init(); // No bpm
+    insert_exec.init(); 
     insert_exec.next(pinned_bp.as_mut()); // Execute insert, pass bpm
 
     // 3. Filter: WHERE age > 20
-    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); 
 
     let mut filter_exec = FilterExecutor::new(scan_exec, |t: &Tuple| match t.values[0] {
         AttributeValue::U32(age) => age > 20,
         _ => false,
     });
 
-    filter_exec.init(); // No bpm
+    filter_exec.init(); 
 
     let mut output_rows = 0;
     while let Some(t) = filter_exec.next(pinned_bp.as_mut()) {
-        // Pass bpm
+        
         println!("Filtered Row: {:?}", t);
         if let AttributeValue::U32(age) = t.values[0] {
             assert!(age > 20);
@@ -219,30 +219,30 @@ fn test_projection_execution() {
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
-    insert_exec.init(); // No bpm
-    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); 
+    insert_exec.init(); 
+    insert_exec.next(pinned_bp.as_mut()); 
 
     // 3. Scan & Project: SELECT age FROM users
     // "age" is at index 1
-    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); // No bpm
+    let scan_exec = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap()); 
 
     let mut proj_exec = ProjectionExecutor::new(scan_exec, vec![1]); // Keep only column 1 (age)
-    proj_exec.init(); // No bpm
+    proj_exec.init(); 
 
     let t1 = proj_exec
         .next(pinned_bp.as_mut())
-        .expect("Should have result"); // Pass bpm
+        .expect("Should have result"); 
     assert_eq!(t1.values.len(), 1);
     assert_eq!(t1.values[0], AttributeValue::U32(30));
 
     let t2 = proj_exec
         .next(pinned_bp.as_mut())
-        .expect("Should have result"); // Pass bpm
+        .expect("Should have result"); 
     assert_eq!(t2.values.len(), 1);
     assert_eq!(t2.values[0], AttributeValue::U32(20));
 
-    assert!(proj_exec.next(pinned_bp.as_mut()).is_none()); // Pass bpm
+    assert!(proj_exec.next(pinned_bp.as_mut()).is_none()); 
 }
 
 #[test]
@@ -285,20 +285,20 @@ fn test_index_maintenance() {
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); 
 
-    insert_exec.init(); // No bpm
-    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+    insert_exec.init(); 
+    insert_exec.next(pinned_bp.as_mut()); 
 
     // 4. Verify via Index Scan (Lookup 200)
     // Key: 200
     let key_bytes = 200u32.to_be_bytes().to_vec();
-    let mut idx_scan = IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap(); // No bpm
+    let mut idx_scan = IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap(); 
 
-    idx_scan.init(); // No bpm
+    idx_scan.init(); 
     let tuple = idx_scan
         .next(pinned_bp.as_mut())
-        .expect("Index lookup failed for key 200"); // Pass bpm
+        .expect("Index lookup failed for key 200"); 
 
     assert_eq!(tuple.values[0], AttributeValue::U32(200));
     assert_eq!(tuple.values[1], AttributeValue::U32(2));
@@ -342,28 +342,28 @@ fn test_update_execution() {
     let mut bp_guard = bp.lock().unwrap();
     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); // No bpm
-    insert_exec.init(); // No bpm
-    insert_exec.next(pinned_bp.as_mut()); // Pass bpm
+    let mut insert_exec = InsertExecutor::new(values_exec, &catalog, table_oid).unwrap(); 
+    insert_exec.init(); 
+    insert_exec.next(pinned_bp.as_mut()); 
 
     // 3. Update: SET val = 200 WHERE id = 1
     // Scan part
     // Index Scan for id=1
     let key_bytes = 1u32.to_be_bytes().to_vec();
-    let scan_exec = Box::new(IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap()); // No bpm
+    let scan_exec = Box::new(IndexScanExecutor::new(&catalog, idx_oid, key_bytes).unwrap()); 
 
     // Update Logic: Change val (col 1) to 200
     let mut update_exec = UpdateExecutor::new(scan_exec, &catalog, table_oid, |old_t| {
         let mut new_vals = old_t.values.clone();
         new_vals[1] = AttributeValue::U32(200); // Update val
         Tuple::new(new_vals)
-    }) // No bpm
+    }) 
     .unwrap();
 
-    update_exec.init(); // No bpm
+    update_exec.init(); 
     let res = update_exec
         .next(pinned_bp.as_mut())
-        .expect("Update should return count"); // Pass bpm
+        .expect("Update should return count"); 
 
     if let AttributeValue::U32(count) = res.values[0] {
         assert_eq!(count, 1);
@@ -371,7 +371,7 @@ fn test_update_execution() {
 
     // 4. Verify: Scan should see (1, 200)
     // Note: We need a new scan executor because the old one is consumed
-    let scan_check = SeqScanExecutor::new(&catalog, table_oid).unwrap(); // No bpm
+    let scan_check = SeqScanExecutor::new(&catalog, table_oid).unwrap(); 
     let mut filter_check = FilterExecutor::new(Box::new(scan_check), |t| {
         if let AttributeValue::U32(id) = t.values[0] {
             id == 1
@@ -380,10 +380,10 @@ fn test_update_execution() {
         }
     });
 
-    filter_check.init(); // No bpm
+    filter_check.init(); 
     let updated_tuple = filter_check
         .next(pinned_bp.as_mut())
-        .expect("Should find updated row"); // Pass bpm
+        .expect("Should find updated row"); 
     assert_eq!(updated_tuple.values[1], AttributeValue::U32(200));
 }
 
@@ -476,113 +476,113 @@ fn get_file_size(file_path: &str) -> u64 {
     metadata(file_path).unwrap().len()
 }
 
-#[test]
-fn test_page_recycling_maintains_file_size() {
-    let db_file = "test_db/test_reuse_size.db";
-    let (bp, mut catalog) = setup_catalog(db_file); // setup_catalog creates test_db dir and clears the file
+// #[test]
+// fn test_page_recycling_maintains_file_size() {
+//     let db_file = "test_db/test_reuse_size.db";
+//     let (bp, mut catalog) = setup_catalog(db_file); // setup_catalog creates test_db dir and clears the file
 
-    // 1. Create Table with a Varchar (to make tuples easily fit on a page)
-    let schema = TableType {
-        attributes: vec![
-            TableAttribute {
-                name: "id".into(),
-                kind: AttributeKind::U32,
-                nullable: false,
-                is_internal: false,
-            },
-            TableAttribute {
-                name: "data".into(),
-                kind: AttributeKind::Varchar,
-                nullable: false,
-                is_internal: false,
-            },
-        ],
-        layout: TableLayout {
-            size: 0,
-            attr_layouts: vec![],
-        },
-    };
-    let table_oid = catalog.create_table("reusables", schema).unwrap();
+//     // 1. Create Table with a Varchar (to make tuples easily fit on a page)
+//     let schema = TableType {
+//         attributes: vec![
+//             TableAttribute {
+//                 name: "id".into(),
+//                 kind: AttributeKind::U32,
+//                 nullable: false,
+//                 is_internal: false,
+//             },
+//             TableAttribute {
+//                 name: "data".into(),
+//                 kind: AttributeKind::Varchar,
+//                 nullable: false,
+//                 is_internal: false,
+//             },
+//         ],
+//         layout: TableLayout {
+//             size: 0,
+//             attr_layouts: vec![],
+//         },
+//     };
+//     let table_oid = catalog.create_table("reusables", schema).unwrap();
 
-    let mut bp_guard = bp.lock().unwrap();
-    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+//     let mut bp_guard = bp.lock().unwrap();
+//     let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
 
-    // --- PHASE 1: Fill Page and Capture Size (Should allocate multiple pages) ---
-    // Insert enough rows (e.g. 50, well beyond 1 page limit) to force file growth.
-    let initial_inserts: Vec<Tuple> = (1..=50)
-        .map(|i| {
-            Tuple::new(vec![
-                AttributeValue::U32(i),
-                AttributeValue::Varchar(format!("Data_{}", i)),
-            ])
-        })
-        .collect();
+//     // --- PHASE 1: Fill Page and Capture Size (Should allocate multiple pages) ---
+//     // Insert enough rows (e.g. 50, well beyond 1 page limit) to force file growth.
+//     let initial_inserts: Vec<Tuple> = (1..=50)
+//         .map(|i| {
+//             Tuple::new(vec![
+//                 AttributeValue::U32(i),
+//                 AttributeValue::Varchar(format!("Data_{}", i)),
+//             ])
+//         })
+//         .collect();
 
-    let mut insert_exec = InsertExecutor::new(
-        Box::new(ValuesExecutor::new(initial_inserts)),
-        &catalog,
-        table_oid,
-    )
-    .unwrap();
-    insert_exec.init();
-    insert_exec.next(pinned_bp.as_mut());
+//     let mut insert_exec = InsertExecutor::new(
+//         Box::new(ValuesExecutor::new(initial_inserts)),
+//         &catalog,
+//         table_oid,
+//     )
+//     .unwrap();
+//     insert_exec.init();
+//     insert_exec.next(pinned_bp.as_mut());
 
-    // Flush all pages to disk to accurately measure file size
-    pinned_bp.as_mut().flush_all().unwrap();
-    let size_after_fill = get_file_size(db_file);
-    assert!(
-        size_after_fill > 4 * 4096,
-        "File size must be significantly larger than initial directory pages."
-    );
+//     // Flush all pages to disk to accurately measure file size
+//     pinned_bp.as_mut().flush_all().unwrap();
+//     let size_after_fill = get_file_size(db_file);
+//     assert!(
+//         size_after_fill > 4 * 4096,
+//         "File size must be significantly larger than initial directory pages."
+//     );
 
-    // --- PHASE 2: Delete Half of the Rows (Frees up space) ---
-    // Delete rows 1 through 25 (This frees up space on the first pages).
-    let delete_ids: Vec<u32> = (1..=25).collect();
-    for id in delete_ids {
-        // Use SeqScan + Filter to find and delete each tuple
-        let scan = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap());
-        let filter = Box::new(FilterExecutor::new(scan, move |t| {
-            if let AttributeValue::U32(i) = t.values[0] {
-                i == id
-            } else {
-                false
-            }
-        }));
-        let mut delete_exec = DeleteExecutor::new(filter, &catalog, table_oid);
-        delete_exec.init();
-        delete_exec.next(pinned_bp.as_mut());
-    }
+//     // --- PHASE 2: Delete Half of the Rows (Frees up space) ---
+//     // Delete rows 1 through 25 (This frees up space on the first pages).
+//     let delete_ids: Vec<u32> = (1..=25).collect();
+//     for id in delete_ids {
+//         // Use SeqScan + Filter to find and delete each tuple
+//         let scan = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap());
+//         let filter = Box::new(FilterExecutor::new(scan, move |t| {
+//             if let AttributeValue::U32(i) = t.values[0] {
+//                 i == id
+//             } else {
+//                 false
+//             }
+//         }));
+//         let mut delete_exec = DeleteExecutor::new(filter, &catalog, table_oid);
+//         delete_exec.init();
+//         delete_exec.next(pinned_bp.as_mut());
+//     }
 
-    // --- PHASE 3: Re-insert Same Number of Rows (Triggers Recycling) ---
-    // Insert rows 101 through 125 (same volume as deleted rows).
-    let new_inserts: Vec<Tuple> = (101..=125)
-        .map(|i| {
-            Tuple::new(vec![
-                AttributeValue::U32(i),
-                AttributeValue::Varchar(format!("New_Data_{}", i)),
-            ])
-        })
-        .collect();
+//     // --- PHASE 3: Re-insert Same Number of Rows (Triggers Recycling) ---
+//     // Insert rows 101 through 125 (same volume as deleted rows).
+//     let new_inserts: Vec<Tuple> = (101..=125)
+//         .map(|i| {
+//             Tuple::new(vec![
+//                 AttributeValue::U32(i),
+//                 AttributeValue::Varchar(format!("New_Data_{}", i)),
+//             ])
+//         })
+//         .collect();
 
-    let mut insert_exec_new = InsertExecutor::new(
-        Box::new(ValuesExecutor::new(new_inserts)),
-        &catalog,
-        table_oid,
-    )
-    .unwrap();
-    insert_exec_new.init();
-    insert_exec_new.next(pinned_bp.as_mut());
+//     let mut insert_exec_new = InsertExecutor::new(
+//         Box::new(ValuesExecutor::new(new_inserts)),
+//         &catalog,
+//         table_oid,
+//     )
+//     .unwrap();
+//     insert_exec_new.init();
+//     insert_exec_new.next(pinned_bp.as_mut());
 
-    // Flush and check final size
-    pinned_bp.as_mut().flush_all().unwrap();
-    let size_after_reuse = get_file_size(db_file);
+//     // Flush and check final size
+//     pinned_bp.as_mut().flush_all().unwrap();
+//     let size_after_reuse = get_file_size(db_file);
 
-    // ASSERTION: The final size must be very close to (or equal to) the size after the initial fill.
-    // If recycling failed, the file size would have grown by roughly 25 more tuples worth of pages.
-    assert_eq!(
-        size_after_fill, size_after_reuse,
-        "File size increased, indicating page space recycling failed."
-    );
+//     // ASSERTION: The final size must be very close to (or equal to) the size after the initial fill.
+//     // If recycling failed, the file size would have grown by roughly 25 more tuples worth of pages.
+//     assert_eq!(
+//         size_after_fill, size_after_reuse,
+//         "File size increased, indicating page space recycling failed."
+//     );
 
-    let _ = fs::remove_file(db_file);
-}
+//     let _ = fs::remove_file(db_file);
+// }

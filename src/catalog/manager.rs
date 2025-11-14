@@ -5,7 +5,6 @@ use crate::storage::buffer::BufferPool;
 
 use crate::storage::heap::heap_file::HeapFile;
 use crate::storage::heap::iterator::HeapIterator;
-use crate::storage::heap::row::RowId; // Import RowId
 use crate::storage::heap::tuple::Tuple;
 use crate::storage::page::base::PageKind;
 use std::collections::HashMap;
