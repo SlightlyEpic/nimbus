@@ -18,6 +18,7 @@ use nimbus::storage::disk::FileManager;
 use nimbus::storage::heap::tuple::Tuple;
 use nimbus::storage::page_locator::locator::DirectoryPageLocator;
 use std::fs;
+use std::fs::metadata;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -469,4 +470,119 @@ fn test_delete_updates_index() {
     seq_scan.init();
     let seq_res = seq_scan.next(pinned_bp.as_mut());
     assert!(seq_res.is_none(), "Seq scan should not find deleted tuple");
+}
+
+fn get_file_size(file_path: &str) -> u64 {
+    metadata(file_path).unwrap().len()
+}
+
+#[test]
+fn test_page_recycling_maintains_file_size() {
+    let db_file = "test_db/test_reuse_size.db";
+    let (bp, mut catalog) = setup_catalog(db_file); // setup_catalog creates test_db dir and clears the file
+
+    // 1. Create Table with a Varchar (to make tuples easily fit on a page)
+    let schema = TableType {
+        attributes: vec![
+            TableAttribute {
+                name: "id".into(),
+                kind: AttributeKind::U32,
+                nullable: false,
+                is_internal: false,
+            },
+            TableAttribute {
+                name: "data".into(),
+                kind: AttributeKind::Varchar,
+                nullable: false,
+                is_internal: false,
+            },
+        ],
+        layout: TableLayout {
+            size: 0,
+            attr_layouts: vec![],
+        },
+    };
+    let table_oid = catalog.create_table("reusables", schema).unwrap();
+
+    let mut bp_guard = bp.lock().unwrap();
+    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+
+    // --- PHASE 1: Fill Page and Capture Size (Should allocate multiple pages) ---
+    // Insert enough rows (e.g. 50, well beyond 1 page limit) to force file growth.
+    let initial_inserts: Vec<Tuple> = (1..=50)
+        .map(|i| {
+            Tuple::new(vec![
+                AttributeValue::U32(i),
+                AttributeValue::Varchar(format!("Data_{}", i)),
+            ])
+        })
+        .collect();
+
+    let mut insert_exec = InsertExecutor::new(
+        Box::new(ValuesExecutor::new(initial_inserts)),
+        &catalog,
+        table_oid,
+    )
+    .unwrap();
+    insert_exec.init();
+    insert_exec.next(pinned_bp.as_mut());
+
+    // Flush all pages to disk to accurately measure file size
+    pinned_bp.as_mut().flush_all().unwrap();
+    let size_after_fill = get_file_size(db_file);
+    assert!(
+        size_after_fill > 4 * 4096,
+        "File size must be significantly larger than initial directory pages."
+    );
+
+    // --- PHASE 2: Delete Half of the Rows (Frees up space) ---
+    // Delete rows 1 through 25 (This frees up space on the first pages).
+    let delete_ids: Vec<u32> = (1..=25).collect();
+    for id in delete_ids {
+        // Use SeqScan + Filter to find and delete each tuple
+        let scan = Box::new(SeqScanExecutor::new(&catalog, table_oid).unwrap());
+        let filter = Box::new(FilterExecutor::new(scan, move |t| {
+            if let AttributeValue::U32(i) = t.values[0] {
+                i == id
+            } else {
+                false
+            }
+        }));
+        let mut delete_exec = DeleteExecutor::new(filter, &catalog, table_oid);
+        delete_exec.init();
+        delete_exec.next(pinned_bp.as_mut());
+    }
+
+    // --- PHASE 3: Re-insert Same Number of Rows (Triggers Recycling) ---
+    // Insert rows 101 through 125 (same volume as deleted rows).
+    let new_inserts: Vec<Tuple> = (101..=125)
+        .map(|i| {
+            Tuple::new(vec![
+                AttributeValue::U32(i),
+                AttributeValue::Varchar(format!("New_Data_{}", i)),
+            ])
+        })
+        .collect();
+
+    let mut insert_exec_new = InsertExecutor::new(
+        Box::new(ValuesExecutor::new(new_inserts)),
+        &catalog,
+        table_oid,
+    )
+    .unwrap();
+    insert_exec_new.init();
+    insert_exec_new.next(pinned_bp.as_mut());
+
+    // Flush and check final size
+    pinned_bp.as_mut().flush_all().unwrap();
+    let size_after_reuse = get_file_size(db_file);
+
+    // ASSERTION: The final size must be very close to (or equal to) the size after the initial fill.
+    // If recycling failed, the file size would have grown by roughly 25 more tuples worth of pages.
+    assert_eq!(
+        size_after_fill, size_after_reuse,
+        "File size increased, indicating page space recycling failed."
+    );
+
+    let _ = fs::remove_file(db_file);
 }

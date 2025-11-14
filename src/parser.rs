@@ -4,7 +4,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AstStatement {
     Insert {
         table_name: String,
@@ -14,6 +14,15 @@ pub enum AstStatement {
     Select {
         table_name: String,
         selection: Vec<String>,
+        filter: Option<(String, AstValue)>,
+    },
+    Update {
+        table_name: String,
+        assignments: Vec<(String, AstValue)>,
+        filter: Option<(String, AstValue)>,
+    },
+    Delete {
+        table_name: String,
         filter: Option<(String, AstValue)>,
     },
     CreateTable {
@@ -102,24 +111,7 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
                     .map(|item| item.to_string())
                     .collect();
 
-                let filter = if let Some(expr) = select.selection {
-                    if let Expr::BinaryOp { left, op, right } = expr {
-                        if op == BinaryOperator::Eq {
-                            let col = left.to_string();
-                            let val = convert_sql_value(match *right {
-                                Expr::Value(v) => v,
-                                _ => return Err("Filter value must be a literal".to_string()),
-                            })?;
-                            Some((col, val))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let filter = parse_optional_filter(select.selection)?;
 
                 Ok(AstStatement::Select {
                     table_name,
@@ -129,6 +121,70 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
             } else {
                 Err("Unsupported query type (must be SELECT)".to_string())
             }
+        }
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            let table_name = match table.relation {
+                TableFactor::Table { name, .. } => name.0.get(0).unwrap().value.clone(),
+                _ => return Err("Unsupported UPDATE relation".to_string()),
+            };
+
+            let assignments = assignments
+                .into_iter()
+                .map(|assignment| {
+                    let col_name = assignment.id.last().unwrap().value.clone();
+                    let value = match assignment.value {
+                        Expr::Value(v) => convert_sql_value(v),
+                        _ => Err("UPDATE SET value must be a literal".to_string()),
+                    }?;
+                    Ok((col_name, value))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            let filter = parse_optional_filter(selection)?;
+
+            Ok(AstStatement::Update {
+                table_name,
+                assignments,
+                filter,
+            })
+        }
+        Statement::Delete {
+            from, selection, ..
+        } => {
+            // Handle DELETE statement - 'from' is FromTable enum
+            use sqlparser::ast::FromTable;
+
+            let table_name = match from {
+                FromTable::WithFromKeyword(tables) => {
+                    if let Some(table_with_joins) = tables.get(0) {
+                        match &table_with_joins.relation {
+                            TableFactor::Table { name, .. } => name.0.get(0).unwrap().value.clone(),
+                            _ => return Err("Unsupported DELETE relation".to_string()),
+                        }
+                    } else {
+                        return Err("DELETE must have a FROM clause".to_string());
+                    }
+                }
+                FromTable::WithoutKeyword(tables) => {
+                    if let Some(table_with_joins) = tables.get(0) {
+                        match &table_with_joins.relation {
+                            TableFactor::Table { name, .. } => name.0.get(0).unwrap().value.clone(),
+                            _ => return Err("Unsupported DELETE relation".to_string()),
+                        }
+                    } else {
+                        return Err("DELETE must specify a table".to_string());
+                    }
+                }
+            };
+
+            let filter = parse_optional_filter(selection)?;
+
+            Ok(AstStatement::Delete { table_name, filter })
         }
         Statement::CreateTable { name, columns, .. } => {
             let table_name = name.0.get(0).unwrap().value.clone();
@@ -169,6 +225,23 @@ pub fn parse(sql: &str) -> Result<AstStatement, String> {
         }
         _ => Err("Unsupported SQL statement type.".to_string()),
     }
+}
+
+fn parse_optional_filter(expr: Option<Expr>) -> Result<Option<(String, AstValue)>, String> {
+    if let Some(expr) = expr {
+        if let Expr::BinaryOp { left, op, right } = expr {
+            if op == BinaryOperator::Eq {
+                let col = left.to_string();
+                let val = convert_sql_value(match *right {
+                    Expr::Value(v) => v,
+                    _ => return Err("Filter value must be a literal".to_string()),
+                })?;
+                return Ok(Some((col, val)));
+            }
+        }
+        return Err("Unsupported WHERE clause (must be simple equality)".to_string());
+    }
+    Ok(None)
 }
 
 fn convert_sql_value(sql_val: Value) -> Result<AstValue, String> {

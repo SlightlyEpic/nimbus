@@ -79,15 +79,12 @@ impl HeapFile {
         data
     }
 
-    // src/storage/heap/heap_file.rs
-
     pub fn insert(
         &mut self,
         mut bpm: Pin<&mut BufferPool>,
         page_id_counter: &AtomicU32,
         data: &[u8],
     ) -> Result<RowId, HeapError> {
-        // 1. Calculate Required Space
         let required_space =
             data.len() as u32 + page::slotted_data::SlottedData::SLOT_META_SIZE as u32;
 
@@ -105,24 +102,23 @@ impl HeapFile {
                 let space = if let page::base::Page::SlottedData(slotted) = page_view {
                     slotted.free_space()
                 } else {
-                    0 // Invalid page type
+                    0
                 };
 
-                bpm.as_mut().unpin_frame(frame_id).ok(); // Unpin after reading space
+                bpm.as_mut().unpin_frame(frame_id).ok();
 
                 if space >= required_space {
                     insert_page_id = last_page_id;
                 }
             }
-            // If fetch failed or page was full, insert_page_id remains 0
         }
 
-        // --- B. Search Reusable Pages (Run 18 Logic) ---
+        // --- B. Search Reusable Pages (Run 18 Logic: Directory Check) ---
         if insert_page_id == 0 {
             let (core, locator) = bpm.as_mut().get_core_and_locator();
             let reusable_id_opt: Option<PageId> = locator
                 .find_page_with_space(required_space, core)
-                .map_err(|e| HeapError::FindSpace(format!("{:?}", e)))?; // Yields Option<PageId> or returns HeapError
+                .map_err(|e| HeapError::FindSpace(format!("{:?}", e)))?;
 
             if let Some(reusable_id) = reusable_id_opt {
                 insert_page_id = reusable_id;
@@ -132,7 +128,7 @@ impl HeapFile {
         // --- C. Execute Insert on Existing Page (Reusable Page or Last Page) ---
         if insert_page_id != 0 {
             let page_id = insert_page_id;
-            let frame = bpm // Re-fetch, pins it again for insertion
+            let frame = bpm
                 .as_mut()
                 .fetch_page(page_id)
                 .map_err(|e| HeapError::FetchPage(format!("{:?}", e)))?;
@@ -155,7 +151,7 @@ impl HeapFile {
 
             let (core, locator) = bpm.as_mut().get_core_and_locator();
             locator
-                .update_page_free_space(page_id, new_free_space, core)
+                .update_page_free_space(page_id, new_free_space, core) // <-- UPDATE DIRECTORY
                 .map_err(|e| HeapError::UpdateSpace(format!("{:?}", e)))?;
 
             bpm.as_mut().unpin_frame(frame_id).ok();

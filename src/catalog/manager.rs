@@ -380,7 +380,6 @@ impl Catalog {
         self.index_meta_cache.get(&index_oid).cloned()
     }
 
-    /// FIX: Added function for E0599
     pub fn find_index_for_column(&self, table_name: &str, col_name: &str) -> Option<u32> {
         let table_oid = self.get_table_oid(table_name)?;
         let schema = self.get_table_schema(table_oid)?;
