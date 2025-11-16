@@ -1,5 +1,4 @@
 use crate::{
-    constants,
     rt_type::primitives::{self, AttributeKind, AttributeValue, TableAttribute},
 };
 use std::convert::TryInto;

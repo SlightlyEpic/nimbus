@@ -78,7 +78,7 @@ impl<'a> BPlusTree<'a> {
 
     fn delete_entry(&mut self, page_id: PageId, key: &[u8]) -> Result<(), BTreeError> {
         // 1. Fetch Page and Remove Entry
-        let (is_underflow, parent_id) = {
+        let (is_underflow, _parent_id) = {
             let frame = self
                 .bpm
                 .as_mut()
@@ -220,7 +220,7 @@ impl<'a> BPlusTree<'a> {
         &mut self,
         page_id: PageId,
         parent_id: PageId,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<(), BTreeError> {
         let (left_sib, right_sib, index_in_parent) = {
             let frame = self

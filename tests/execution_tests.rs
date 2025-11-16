@@ -472,6 +472,7 @@ fn test_delete_updates_index() {
     assert!(seq_res.is_none(), "Seq scan should not find deleted tuple");
 }
 
+#[allow(dead_code)]
 fn get_file_size(file_path: &str) -> u64 {
     metadata(file_path).unwrap().len()
 }

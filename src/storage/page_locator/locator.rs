@@ -1,10 +1,9 @@
-use crate::storage::buffer::buffer_pool::{BufferPoolCore, errors as BPErrors};
+use crate::storage::buffer::buffer_pool::BufferPoolCore;
 use crate::storage::page::{
     self,
-    base::{self, DiskPage, PageId},
+    base,
     directory::{Directory, DirectoryEntry},
 };
-use std::num::NonZeroU64;
 use std::pin::Pin;
 
 pub mod errors {
@@ -110,7 +109,6 @@ impl PageLocator for DirectoryPageLocator {
             let curr_frame_id = curr_frame.fid();
             let mut page_view = curr_frame.page_view();
 
-            use crate::storage::page::base::DiskPage;
             if let page::base::Page::Directory(dir_page) = &mut page_view {
                 let num_entries = dir_page.num_entries();
                 for i in 0..num_entries {
@@ -164,7 +162,6 @@ impl PageLocator for DirectoryPageLocator {
             let curr_frame_id = curr_frame.fid();
             let mut page_view = curr_frame.page_view();
 
-            use crate::storage::page::base::DiskPage;
             if let page::base::Page::Directory(dir_page) = &mut page_view {
                 if dir_page.free_space() >= (Directory::ENTRY_SIZE as u32) {
                     dir_page

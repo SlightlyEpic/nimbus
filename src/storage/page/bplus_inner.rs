@@ -421,7 +421,6 @@ impl<'a> BPlusInner<'a> {
         target: &mut BPlusInner,
         separator_key: &[u8],
     ) -> Vec<u8> {
-        let num_keys = self.num_entries() as usize;
 
         let first_key = self.get_key_at(0).to_vec();
         let first_child = self.get_child_at(0).unwrap();

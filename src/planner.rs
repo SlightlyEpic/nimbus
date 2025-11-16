@@ -8,11 +8,11 @@ use crate::execution::projection::ProjectionExecutor;
 use crate::execution::seq_scan::SeqScanExecutor;
 use crate::execution::update::UpdateExecutor;
 use crate::execution::values::ValuesExecutor;
-use crate::parser::{AstDataType, AstStatement, AstValue};
+use crate::parser::{AstStatement, AstValue};
 use crate::rt_type::primitives::{
-    AttributeKind, AttributeValue, TableAttribute, TableLayout, TableType,
+    AttributeValue, TableType,
 };
-use crate::storage::heap::tuple::{self, Tuple};
+use crate::storage::heap::tuple::Tuple;
 use std::collections::HashMap;
 
 pub struct Planner<'a> {

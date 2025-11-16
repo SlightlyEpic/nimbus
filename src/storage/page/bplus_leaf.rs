@@ -1,5 +1,4 @@
 use crate::storage::bplus_tree::SplitResult;
-use crate::storage::heap::row::RowId;
 use crate::storage::page::header::PageHeader;
 use crate::{
     constants,
@@ -180,7 +179,6 @@ impl<'a> BPlusLeaf<'a> {
 
     /// Inserts a key-value pair, maintaining sorted order.
     pub fn insert_sorted(&mut self, key: &[u8], value: u64) {
-        let key_size = self.get_key_size() as usize;
         let curr_size = self.num_entries() as usize;
 
         if let Some(pos) = self.find_key_position(key) {

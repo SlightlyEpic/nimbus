@@ -2,9 +2,9 @@ use crate::constants;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 
 pub struct FileManager {
+    #[allow(unused)]
     file_path: String,
     pub file: File,
 }

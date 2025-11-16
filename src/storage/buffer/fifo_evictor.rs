@@ -2,11 +2,13 @@ use crate::storage::buffer::{Evictor, Frame};
 use std::collections::{HashMap, VecDeque};
 
 struct EvictorFrameMeta {
+    #[allow(unused)]
     pub fid: u32,
     // the evictor will not track pinned, dirty, ready etc.
     // it is the responsibility of the consumer to inform the
     // evictor when a frame's evictability changes
     pub evictable: bool,
+    #[allow(unused)]
     pub evicted: bool,
 }
 

@@ -1,5 +1,3 @@
-// src/storage/buffer/buffer_pool.rs
-
 use crate::constants;
 use crate::storage::buffer::Evictor;
 use crate::storage::disk;
@@ -8,7 +6,6 @@ use crate::storage::{page, page::base};
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const FRAME_COUNT: usize = 128;
 
@@ -797,7 +794,7 @@ mod buffer_tests {
     use crate::storage::buffer::fifo_evictor::FifoEvictor;
     use crate::storage::disk::FileManager;
     use crate::storage::page::base::{PageId, PageKind};
-    use crate::storage::page_locator::locator::{self, PageLocator};
+    use crate::storage::page_locator::locator;
     use std::fs;
     use std::path::PathBuf;
 

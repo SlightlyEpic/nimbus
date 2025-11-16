@@ -217,7 +217,7 @@ impl Catalog {
         table_oid: u32,
         col: &TableAttribute,
         schema: &TableType,
-        mut bpm: Pin<&mut BufferPool>,
+        bpm: Pin<&mut BufferPool>,
     ) {
         let max_len = match col.kind {
             AttributeKind::Char(n) => n as u16,
@@ -863,7 +863,7 @@ mod tests {
             catalog.create_table("saved_table", schema).unwrap();
 
             let mut bp_guard = bp.lock().unwrap();
-            let mut pinned_bp = unsafe { std::pin::Pin::new_unchecked(&mut *bp_guard) };
+            let pinned_bp = unsafe { std::pin::Pin::new_unchecked(&mut *bp_guard) };
             pinned_bp.flush_all().unwrap();
         }
 
@@ -874,7 +874,7 @@ mod tests {
                 Box::new(FifoEvictor::new()),
                 Box::new(DirectoryPageLocator::new()),
             )));
-            let mut catalog = Catalog::new(bp.clone()); // FIX: was 'let'
+            let catalog = Catalog::new(bp.clone()); // FIX: was 'let'
 
             let oid = catalog.get_table_oid("saved_table");
             assert!(
@@ -937,7 +937,7 @@ mod tests {
         // Simulate crash/restart by dropping catalog and creating new one
         drop(catalog);
 
-        let mut catalog_2 = Catalog::new(bp.clone());
+        let catalog_2 = Catalog::new(bp.clone());
         let recovered_oid = catalog_2.get_index_oid("idx_id");
         assert_eq!(
             recovered_oid,

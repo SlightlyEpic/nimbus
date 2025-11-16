@@ -260,7 +260,6 @@ mod tests {
     use super::*;
     use crate::storage::buffer::fifo_evictor::FifoEvictor;
     use crate::storage::disk::FileManager;
-    use crate::storage::heap::heap_file::HeapFile;
     use crate::storage::page_locator::locator::DirectoryPageLocator;
     use std::fs;
     use std::path::PathBuf;

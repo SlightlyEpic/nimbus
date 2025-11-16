@@ -1,6 +1,6 @@
 use super::executor::Executor;
 use crate::catalog::manager::Catalog;
-use crate::rt_type::primitives::{AttributeValue, TableType};
+use crate::rt_type::primitives::AttributeValue;
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::tuple::Tuple;
 use std::pin::Pin;

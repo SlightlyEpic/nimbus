@@ -1,5 +1,4 @@
 use nimbus::catalog::manager::Catalog;
-use nimbus::execution::executor::Executor;
 use nimbus::parser;
 use nimbus::planner::Planner;
 use nimbus::rt_type::primitives::{AttributeKind, TableAttribute, TableLayout, TableType};
@@ -164,7 +163,7 @@ fn main() {
 
     println!("\x1B[1;34mFlushing data to disk...\x1B[0m");
     let mut bp_guard = bp.lock().unwrap();
-    let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+    let pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
     pinned_bp.flush_all().expect("Failed to flush all pages.");
     println!("\x1B[1;32mAll data flushed to {}.\x1B[0m", current_db_path);
 }
@@ -198,7 +197,7 @@ fn use_database(
 
     {
         let mut bp_guard = bp.lock().map_err(|_| "Lock poisoned")?;
-        let mut pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
+        let pinned_bp = unsafe { Pin::new_unchecked(&mut *bp_guard) };
         pinned_bp
             .flush_all()
             .map_err(|e| format!("Failed to flush: {:?}", e))?;
